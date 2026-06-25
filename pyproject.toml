@@ -77,7 +77,7 @@ write_to = "src/leds/_version.py"
 
 
 [tool.setuptools.package-data]
-leds = ["logos/*"]
+leds = ["logos/*", "templates/*"]
 
 
 [tool.pytest.ini_options]

@@ -54,8 +54,14 @@ def _serve(args):
                 "restarts and are shared across replicas.",
                 file=sys.stderr,
             )
+        import importlib.resources  # noqa: PLC0415 (only needed when auth is on)
+
         serve_kwargs["basic_auth"] = args.basic_auth
         serve_kwargs["cookie_secret"] = cookie_secret
+        # LEGEND-branded login page instead of Panel's default.
+        serve_kwargs["login_template"] = str(
+            importlib.resources.files("leds") / "templates" / "login.html"
+        )
 
     pn.serve(_bound_factory(args.base_path), **serve_kwargs)
 
