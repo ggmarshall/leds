@@ -89,10 +89,14 @@ def user_chip(user):
     import html  # noqa: PLC0415 (tiny stdlib helper, login-only path)
 
     name = html.escape(user)
+    # the anchor is styled as a button to match the login page's buttons
     return (
-        f'<span style="color:{HEADER_COLOR};font-size:0.9em;white-space:nowrap;">'
-        f"{name} &middot; "
-        f'<a href="./logout" style="color:{HEADER_COLOR};">Log out</a></span>'
+        f'<span style="color:{HEADER_COLOR};font-size:0.9em;white-space:nowrap;'
+        'display:inline-flex;align-items:center;gap:10px;">'
+        f"{name}"
+        f'<a href="./logout" style="background:{HEADER_COLOR};color:#ffffff;'
+        "border:1px solid #1a2a5b;border-radius:4px;padding:4px 12px;"
+        'text-decoration:none;font-size:0.95em;">Log out</a></span>'
     )
 
 
