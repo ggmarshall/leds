@@ -265,6 +265,12 @@ class EventViewer:
 
         self._n_events_cache: dict[str, int] = {}
         self._status_cache: dict = {}
+        self._run_files_cache: dict[tuple[str, str], list[Path]] = {}
+        self._chmap_cache: dict = {}
+        self._geds_seed_cache: dict = {}
+        #: scratch cache for view modules (static per-channelmap glyph data,
+        #: keyed by ("<what>", tstamp, ...)); pruned in get_event()
+        self.view_cache: dict = {}
 
         # populated by get_event()
         self.chmap = None
@@ -301,11 +307,14 @@ class EventViewer:
         return Path(self.paths[f"tier_{tier}"]) / self.datatype
 
     def _run_files(self, period, run):
-        root = self._tier_root(self.tier) / period / run
-        pattern = (
-            f"{self.experiment}-{period}-{run}-{self.datatype}-*-tier_{self.tier}.lh5"
-        )
-        return sorted(root.glob(pattern))
+        # cached: this is called per event (locate/run_length) and each call
+        # otherwise re-globs a possibly slow network filesystem
+        key = (period, run)
+        if key not in self._run_files_cache:
+            root = self._tier_root(self.tier) / period / run
+            pattern = f"{self.experiment}-{period}-{run}-{self.datatype}-*-tier_{self.tier}.lh5"
+            self._run_files_cache[key] = sorted(root.glob(pattern))
+        return self._run_files_cache[key]
 
     def available_runs(self):
         """Scan the evt tier and return ``{period: {run: [timestamps]}}``."""
@@ -433,11 +442,15 @@ class EventViewer:
 
     # -- event data -----------------------------------------------------------
 
-    def _read_row(self, file, field, local, group=None):
-        """Read one variable-length ``evt`` group row as a Python list."""
-        group = group or self.geds_group
-        vov = lh5.read(f"{group}/{field}", str(file), start_row=local, n_rows=1)
-        return vov.view_as("ak").to_list()[0]
+    def _read_table_row(self, file, group, local, fields):
+        """Read one row of several ``evt`` table fields in a single file open.
+
+        Returns ``{field: python value}`` (variable-length fields as lists).
+        """
+        tbl = lh5.read(
+            group, str(file), start_row=local, n_rows=1, field_mask=list(fields)
+        )
+        return {f: tbl[f].view_as("ak").to_list()[0] for f in fields}
 
     def _status_for(self, tstamp):
         if tstamp not in self._status_cache:
@@ -449,6 +462,30 @@ class EventViewer:
         if self._status is not None and name in self._status:
             return str(self._status[name].usability)
         return "off"
+
+    def _channelmap(self, tstamp):
+        """Channelmap for ``tstamp``; cached, the metadata lookup is not cheap."""
+        if tstamp not in self._chmap_cache:
+            if len(self._chmap_cache) > 16:
+                self._chmap_cache.clear()
+            self._chmap_cache[tstamp] = self.meta.channelmap(tstamp)
+        return self._chmap_cache[tstamp]
+
+    def _geds_seed(self, tstamp):
+        """Baseline ``{detector: 0 | None}`` energies for every ged (cached).
+
+        Seeds every ged so the array view distinguishes "working but no hit"
+        (0 -> grey, under threshold) from "not processable" (None -> white).
+        """
+        if tstamp not in self._geds_seed_cache:
+            if len(self._geds_seed_cache) > 16:
+                self._geds_seed_cache.clear()
+            geds = self.chmap.map("system", unique=False).geds
+            self._geds_seed_cache[tstamp] = {
+                det: (0 if self.chmap[det].analysis.processable else None)
+                for det in geds.map("name")
+            }
+        return dict(self._geds_seed_cache[tstamp])
 
     def get_event(self, period, run, idx):
         file, local = self.locate(period, run, idx)
@@ -462,25 +499,27 @@ class EventViewer:
                 f"{self.group}/trigger/timestamp", str(file), start_row=local, n_rows=1
             ).nda[0]
         )
-        self.chmap = self.meta.channelmap(self.tstamp)
+        self.chmap = self._channelmap(self.tstamp)
+        if len(self.view_cache) > 64:
+            self.view_cache.clear()
 
-        # Seed every ged so the array view distinguishes "working but no hit"
-        # (0 -> grey, under threshold) from "not processable" (None -> white).
-        geds = self.chmap.map("system", unique=False).geds
-        energies: dict = {
-            det: (0 if self.chmap[det].analysis.processable else None)
-            for det in geds.map("name")
-        }
+        energies = self._geds_seed(self.tstamp)
 
         # Single evt/geds row read gives the fired detectors, their energies and
         # the index back into each channel's raw/hit table (for waveforms).
+        geds_row = self._read_table_row(
+            file,
+            self.geds_group,
+            local,
+            ("detector_name", self.energy_field, "rawid", "hit_idx"),
+        )
         names = [
             n.decode() if isinstance(n, bytes | bytearray) else n
-            for n in self._read_row(file, "detector_name", local)
+            for n in geds_row["detector_name"]
         ]
-        values = self._read_row(file, self.energy_field, local)
-        rawids = self._read_row(file, "rawid", local)
-        hit_idxs = self._read_row(file, "hit_idx", local)
+        values = geds_row[self.energy_field]
+        rawids = geds_row["rawid"]
+        hit_idxs = geds_row["hit_idx"]
 
         self.fired_detectors = []
         for name, val, rawid, hit_idx in zip(
@@ -503,14 +542,18 @@ class EventViewer:
         # SiPMs: per channel, sum the energy of its triggered coincident pulses
         # (evt/spms/energy and is_trig_coin_pulse are nested per pulse).
         self._status = self._status_for(self.tstamp)
-        spm_rawids = self._read_row(file, "rawid", local, group=f"{self.group}/spms")
-        spm_trig = self._read_row(
-            file, "is_trig_coin_pulse", local, group=f"{self.group}/spms"
+        spms_row = self._read_table_row(
+            file,
+            f"{self.group}/spms",
+            local,
+            ("rawid", "is_trig_coin_pulse", "energy"),
         )
-        spm_energy = self._read_row(file, "energy", local, group=f"{self.group}/spms")
         self.spms_energy = {}
         for rawid, pulses, pulse_energy in zip(
-            spm_rawids, spm_trig, spm_energy, strict=True
+            spms_row["rawid"],
+            spms_row["is_trig_coin_pulse"],
+            spms_row["energy"],
+            strict=True,
         ):
             # sum of spms.energy over the channel's triggered coincident pulses
             self.spms_energy[int(rawid)] = sum(

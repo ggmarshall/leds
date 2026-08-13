@@ -11,6 +11,7 @@ from __future__ import annotations
 import awkward as ak
 import lh5
 import numpy as np
+from lh5.io.exceptions import LH5DecodeError
 
 #: Binary cuts: key -> (label, positive-option label, negative-option label).
 #: Each option is an independent checkbox; the positive option keeps events
@@ -37,6 +38,11 @@ def bins_for_width(width):
     return max(1, round((ENERGY_RANGE[1] - ENERGY_RANGE[0]) / width))
 
 
+#: Cached runs kept per session (each entry holds the run's full per-hit
+#: energy + cut arrays, so the cache must stay small on a multi-user server).
+MAX_CACHED_RUNS = 2
+
+
 class RunSpectrum:
     """Cut-and-histogram the geds energies of a run."""
 
@@ -46,26 +52,41 @@ class RunSpectrum:
 
     def _load(self, period, run):
         key = (period, run)
-        if key not in self._cache:
+        data = self._cache.pop(key, None)  # re-insert below (LRU order)
+        if data is None:
             files = [str(f) for f in self.viewer._run_files(period, run)]
             group = self.viewer.group  # in-file group ("evt"), not the file tier
 
             def col(field):
                 return lh5.read(f"{group}/{field}", files)
 
-            self._cache[key] = {
-                "energy": col("geds/energy").view_as("ak"),
-                "psd_bb": ak.values_astype(
-                    col("geds/psd/is_bb_like").view_as("ak"), bool
+            def opt(field, conv):
+                # cut fields may be absent in other (non-L200) dataflow cycles;
+                # a missing one just disables that cut instead of breaking the
+                # whole spectrum view
+                try:
+                    return conv(col(field))
+                except (KeyError, LH5DecodeError, OSError):
+                    return None
+
+            as_bool = lambda o: o.nda.astype(bool)  # noqa: E731
+            data = {
+                "energy": col("geds/energy").view_as("ak"),  # required
+                "psd_bb": opt(
+                    "geds/psd/is_bb_like",
+                    lambda o: ak.values_astype(o.view_as("ak"), bool),
                 ),
-                "puls": col("coincident/puls").nda.astype(bool),
-                "muon": col("coincident/muon").nda.astype(bool),
-                "spms": col("coincident/spms").nda.astype(bool),
-                "forced": col("trigger/is_forced").nda.astype(bool),
-                "qc": col("geds/quality/is_bb_like").nda.astype(bool),
-                "mult": col("geds/multiplicity").nda,
+                "puls": opt("coincident/puls", as_bool),
+                "muon": opt("coincident/muon", as_bool),
+                "spms": opt("coincident/spms", as_bool),
+                "forced": opt("trigger/is_forced", as_bool),
+                "qc": opt("geds/quality/is_bb_like", as_bool),
+                "mult": opt("geds/multiplicity", lambda o: o.nda),
             }
-        return self._cache[key]
+        self._cache[key] = data
+        while len(self._cache) > MAX_CACHED_RUNS:
+            self._cache.pop(next(iter(self._cache)))
+        return data
 
     @staticmethod
     def _apply_binary(keep, cond, checked):
@@ -83,32 +104,42 @@ class RunSpectrum:
 
         Each binary cut keeps events where its condition holds (positive option:
         geds_trigger=is_forced, muon/spms=their coincidence, quality=bb-like) or
-        does not (negative option). Multiplicity selects 1 / 2 / >2.
+        does not (negative option). Multiplicity selects 1 / 2 / >2. A cut whose
+        field is missing in this cycle (loaded as ``None``) is skipped.
         """
-        keep = np.ones(len(d["puls"]), dtype=bool)
+        keep = np.ones(len(d["energy"]), dtype=bool)
         conditions = {
             # forced = is_forced | pulser-coincident; normal = its complement
-            "geds_trigger": d["forced"] | d["puls"],
+            "geds_trigger": (
+                d["forced"] | d["puls"]
+                if d["forced"] is not None and d["puls"] is not None
+                else None
+            ),
             "muon": d["muon"],
             "spms": d["spms"],
             "quality": d["qc"],
         }
         for key, cond in conditions.items():
+            if cond is None:
+                continue
             keep = RunSpectrum._apply_binary(keep, cond, cuts.get(key, (False, False)))
 
         mult = cuts.get("multiplicity", "off")
-        if mult == "1":
-            keep &= d["mult"] == 1
-        elif mult == "2":
-            keep &= d["mult"] == 2
-        elif mult == ">2":
-            keep &= d["mult"] > 2
+        if d["mult"] is not None:
+            if mult == "1":
+                keep &= d["mult"] == 1
+            elif mult == "2":
+                keep &= d["mult"] == 2
+            elif mult == ">2":
+                keep &= d["mult"] > 2
         return keep
 
     @staticmethod
     def _kept_energy(d, keep, cuts):
         """Per-hit energies of the kept events, with the per-hit psd cut applied."""
         energy = d["energy"][keep]
+        if d["psd_bb"] is None:  # cycle without psd flags -> cut unavailable
+            return energy
         pos, neg = cuts.get("psd", (False, False))
         if pos and not neg:
             energy = energy[d["psd_bb"][keep]]

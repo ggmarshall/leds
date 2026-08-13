@@ -48,10 +48,16 @@ def raw_kinds_for(system):
 
 
 def category_options(ev, system, grouping):
-    groups = list(group_channels(ev.chmap, system, grouping))
-    # "above threshold" uses geds hit energies, so only for geds
-    base = ["all", "above threshold"] if system == "geds" else ["all"]
-    return base + groups
+    # cached per channelmap: recomputed on every event render otherwise
+    key = ("wf_categories", ev.tstamp, system, grouping)
+    options = ev.view_cache.get(key)
+    if options is None:
+        groups = list(group_channels(ev.chmap, system, grouping))
+        # "above threshold" uses geds hit energies, so only for geds
+        base = ["all", "above threshold"] if system == "geds" else ["all"]
+        options = base + groups
+        ev.view_cache[key] = options
+    return options
 
 
 _MAX_LEGEND_ROWS = 16  # wrap into more columns beyond this many items

@@ -10,7 +10,13 @@ of re-rendering an image.
 from __future__ import annotations
 
 import numpy as np
-from bokeh.models import ColorBar, ColumnDataSource, HoverTool, LinearColorMapper
+from bokeh.models import (
+    ColorBar,
+    ColumnDataSource,
+    HoverTool,
+    LinearColorMapper,
+    TapTool,
+)
 from bokeh.palettes import Viridis256
 from bokeh.plotting import figure
 
@@ -29,33 +35,49 @@ def empty_source():
     return ColumnDataSource(data={c: [] for c in COLUMNS})
 
 
+def _static_data(ev):
+    """The channelmap-derived glyph columns (everything but ``energy``).
+
+    Geometry and per-detector metadata only change with the channelmap, so
+    they are cached per file timestamp instead of being recomputed on every
+    event (which dominates the per-event cost during playback).
+    """
+    key = ("array_static", ev.tstamp)
+    data = ev.view_cache.get(key)
+    if data is None:
+        channel_map = ev.chmap.map("daq.rawid")
+        strings_dict = build_strings_dict(ev.chmap)
+        xs, ys, rawids = get_plot_source(channel_map, strings_dict)
+
+        names, strings, positions, usabilities = [], [], [], []
+        for rawid in rawids:
+            det = channel_map[rawid]
+            names.append(det["name"])
+            strings.append(det["location"]["string"])
+            positions.append(det["location"]["position"])
+            usabilities.append(det["analysis"]["usability"])
+
+        data = {
+            "xs": [list(x) for x in xs],
+            "ys": [list(y) for y in ys],
+            "name": names,
+            "string": strings,
+            "position": positions,
+            "usability": usabilities,
+            "rawid": list(rawids),
+        }
+        ev.view_cache[key] = data
+    return data
+
+
 def build_source_data(ev):
     """Assemble the per-detector glyph columns for the current event."""
-    channel_map = ev.chmap.map("daq.rawid")
-    strings_dict = build_strings_dict(ev.chmap)
-    xs, ys, rawids = get_plot_source(channel_map, strings_dict)
-
-    names, energies, strings, positions, usabilities = [], [], [], [], []
-    for rawid in rawids:
-        det = channel_map[rawid]
-        name = det["name"]
-        value = ev.energy_dict.get(name)
-        names.append(name)
-        energies.append(np.nan if value is None else float(value))
-        strings.append(det["location"]["string"])
-        positions.append(det["location"]["position"])
-        usabilities.append(det["analysis"]["usability"])
-
-    return {
-        "xs": [list(x) for x in xs],
-        "ys": [list(y) for y in ys],
-        "name": names,
-        "energy": energies,
-        "string": strings,
-        "position": positions,
-        "usability": usabilities,
-        "rawid": list(rawids),
-    }
+    static = _static_data(ev)
+    energies = [
+        np.nan if (v := ev.energy_dict.get(name)) is None else float(v)
+        for name in static["name"]
+    ]
+    return {**static, "energy": energies}
 
 
 def make_event_figure(geds_source, sipm_source, *, vmin=25, vmax=6000, spms_vmax=4):
@@ -66,7 +88,7 @@ def make_event_figure(geds_source, sipm_source, *, vmin=25, vmax=6000, spms_vmax
     """
     fig = figure(
         match_aspect=True,
-        tools="tap,pan,wheel_zoom,box_zoom,reset,save",
+        tools="pan,wheel_zoom,box_zoom,reset,save",
         toolbar_location="right",
         x_axis_location=None,
         background_fill_color="white",
@@ -97,6 +119,8 @@ def make_event_figure(geds_source, sipm_source, *, vmin=25, vmax=6000, spms_vmax
         selection_line_color="red",
         selection_line_width=2.5,
     )
+    # tap only selects geds detectors (nothing listens to a SiPM selection)
+    fig.add_tools(TapTool(renderers=[geds_glyph]))
     fig.add_tools(
         HoverTool(
             renderers=[geds_glyph],

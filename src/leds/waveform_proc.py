@@ -21,13 +21,18 @@ from dspeed.vis import WaveformBrowser
 #: Intermediate processing-chain waveforms offered by the dsp view.
 PROCESSED_PARAMS = ("wf_blsub", "wf_pz", "wf_trap", "curr")
 
+#: Browsers kept alive per session. Each holds open read buffers, so the cache
+#: is a bounded LRU: big enough for a full event display plus the all-waveforms
+#: view of one file, small enough not to grow with every file visited.
+MAX_CACHED_BROWSERS = 128
+
 
 class WaveformProcessor:
     """Lazily build/cache dspeed browsers and return processed traces."""
 
     def __init__(self, ev):
         self.ev = ev
-        self._browsers: dict = {}  # (raw_file, channel) -> WaveformBrowser
+        self._browsers: dict = {}  # (raw_file, channel) -> WaveformBrowser (LRU)
         self._dsp_cfgs: dict = {}  # tstamp -> {detector_name: dsp_config_path}
 
     def _dsp_config(self, name):
@@ -43,15 +48,19 @@ class WaveformProcessor:
         raw_file = str(self.ev.raw_file())
         channel = f"ch{rawid:07d}"
         key = (raw_file, channel)
-        if key not in self._browsers:
-            self._browsers[key] = WaveformBrowser(
+        browser = self._browsers.pop(key, None)  # re-insert below (LRU order)
+        if browser is None:
+            browser = WaveformBrowser(
                 raw_file,
                 f"{channel}/raw",
                 dsp_config=self._dsp_config(name),
                 lines=list(PROCESSED_PARAMS),
                 buffer_len=1,
             )
-        return self._browsers[key]
+        self._browsers[key] = browser
+        while len(self._browsers) > MAX_CACHED_BROWSERS:
+            self._browsers.pop(next(iter(self._browsers)))
+        return browser
 
     def processed(self, rawid, name, hit_idx, param):
         """Return ``(x, y)`` arrays for ``param`` at this detector's hit row."""
