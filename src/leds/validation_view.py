@@ -190,7 +190,7 @@ def cal_summary(names, residuals, strings, source_label):
     )
     fig.yaxis.axis_label = "residual (keV)"
     fig.xaxis.ticker = x
-    fig.xaxis.major_label_overrides = {int(i): n for i, n in zip(x, names)}
+    fig.xaxis.major_label_overrides = {int(i): n for i, n in zip(x, names, strict=True)}
     fig.xaxis.major_label_orientation = 1.2
     if strings is not None:
         for i in range(1, len(strings)):
@@ -203,14 +203,14 @@ def cal_summary(names, residuals, strings, source_label):
                         line_dash="dashed",
                     )
                 )
-    for color, (peak, (res, err)) in zip(_PEAK_COLORS, residuals.items()):
+    for color, (peak, (res, err)) in zip(_PEAK_COLORS, residuals.items(), strict=True):
         source = ColumnDataSource(
             {
                 "x": x,
                 "res": res,
                 "name": names,
                 "err_xs": [[i, i] for i in x],
-                "err_ys": [[r - e, r + e] for r, e in zip(res, err)],
+                "err_ys": [[r - e, r + e] for r, e in zip(res, err, strict=True)],
             }
         )
         label = f"{peak:.1f} keV"
@@ -253,7 +253,8 @@ def cal_detail(curve, detector, source_label):
             "err": curve["cal_err"],
             "res_xs": [[p, p] for p in curve["peaks"]],
             "res_ys": [
-                [r - e, r + e] for r, e in zip(curve["residual"], curve["cal_err"])
+                [r - e, r + e]
+                for r, e in zip(curve["residual"], curve["cal_err"], strict=True)
             ],
         }
     )

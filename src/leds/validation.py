@@ -66,7 +66,7 @@ RATE_GROUPS = {
     "qc": ("pass", "fail"),
 }
 KLINE_CONFIGS = ("before cuts", "after QC", "after mult = 1", "after LAr", "after PSD")
-RATE_GROUPS |= {line: KLINE_CONFIGS for line in K_LINES}
+RATE_GROUPS |= dict.fromkeys(K_LINES, KLINE_CONFIGS)
 
 #: Rate unit per group: seconds of exposure per rate unit (1 -> Hz,
 #: 3600 -> counts/hour). All rates are additionally normalised by the
@@ -75,7 +75,7 @@ GROUP_UNIT_SECONDS = {
     "trigger": 1,
     "multiplicity": 1,
     "qc": 1,
-    **{line: 3600 for line in K_LINES},
+    **dict.fromkeys(K_LINES, 3600),
 }
 GROUP_UNIT_LABEL = {1: "rate (Hz / kg)", 3600: "rate (counts / hour / kg)"}
 
@@ -286,9 +286,7 @@ class ValidationData:
                 t0 = math.floor(t.min() / _DAY) * _DAY
                 t1 = math.ceil(t.max() / _DAY) * _DAY
                 t1 = max(t1, t0 + _DAY)
-                axis = bh.axis.Regular(
-                    int((t1 - t0) / BASE_BIN_SECONDS), t0, t1
-                )
+                axis = bh.axis.Regular(int((t1 - t0) / BASE_BIN_SECONDS), t0, t1)
                 series = {}
                 for skey, mask in self._series_masks(d, hit_sel).items():
                     if mask is None:

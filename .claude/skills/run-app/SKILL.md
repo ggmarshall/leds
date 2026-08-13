@@ -1,6 +1,8 @@
 ---
 name: run-app
-description: Launch the leds Panel app against the local mock data and drive/screenshot it with headless Chrome (Playwright) to verify a change visually
+description:
+  Launch the leds Panel app against the local mock data and drive/screenshot it
+  with headless Chrome (Playwright) to verify a change visually
 ---
 
 # Run the leds app and look at it
@@ -47,18 +49,19 @@ with sync_playwright() as p:
     page.on("pageerror", lambda e: errors.append(str(e)))
     page.goto("http://localhost:5006")
     page.wait_for_selector("text=Validation", timeout=60000)
-    page.wait_for_timeout(3000)          # first event render
-    page.click("text=Validation")        # tab names are plain text targets
-    page.wait_for_timeout(4000)          # tabs build lazily on activation
+    page.wait_for_timeout(3000)  # first event render
+    page.click("text=Validation")  # tab names are plain text targets
+    page.wait_for_timeout(4000)  # tabs build lazily on activation
     page.screenshot(path="/tmp/leds.png", full_page=True)
     print("JS errors:", errors or "none")
     browser.close()
 ```
 
 **Gotchas (all hit for real):**
+
 - Bokeh 3 renders widgets inside **shadow DOM**: XPath selectors never match.
-  Playwright *CSS* selectors pierce shadow roots — find a Panel `Select` by
-  one of its options, then `select_option`:
+  Playwright _CSS_ selectors pierce shadow roots — find a Panel `Select` by one
+  of its options, then `select_option`:
   ```python
   show = page.locator("select:has(option[value='trigger rates'])")
   show.select_option("calibration summary")
@@ -66,11 +69,11 @@ with sync_playwright() as p:
   ```
 - Panel `Checkbox` widgets: clicking the label text does NOT toggle them, and
   `label:has-text(...) input` doesn't match either (the input is a direct
-  shadow-root child). Enumerate `page.locator("input[type=checkbox]")` and
-  pick by index (sidebar order first, then tab controls), then
-  `.click(force=True)` and assert `.is_checked()` flipped.
+  shadow-root child). Enumerate `page.locator("input[type=checkbox]")` and pick
+  by index (sidebar order first, then tab controls), then `.click(force=True)`
+  and assert `.is_checked()` flipped.
 - Tabs are `dynamic=True`: content builds on first activation — wait after
   clicking a tab or changing a control, then screenshot.
 - Always print the collected `pageerror`s before declaring success.
-- **Look at the screenshot** (Read the PNG); a blank frame means the
-  websocket origin is wrong (`--allow-websocket-origin localhost:<port>`).
+- **Look at the screenshot** (Read the PNG); a blank frame means the websocket
+  origin is wrong (`--allow-websocket-origin localhost:<port>`).

@@ -72,8 +72,7 @@ class LDAPConfig:
             search_base=env.get("LEDS_LDAP_SEARCH_BASE") or None,
             user_filter=env.get("LEDS_LDAP_USER_FILTER") or "(uid={username})",
             group_dn=env.get("LEDS_LDAP_GROUP_DN") or None,
-            starttls=env.get("LEDS_LDAP_STARTTLS", "").lower()
-            in ("1", "true", "yes"),
+            starttls=env.get("LEDS_LDAP_STARTTLS", "").lower() in ("1", "true", "yes"),
             ca_file=env.get("LEDS_LDAP_CA_FILE") or None,
         )
         cfg._check()
@@ -152,7 +151,9 @@ class LDAPLoginHandler(BasicLoginHandler):
             self.redirect(next_url)
         else:
             error = self._auth_error or "Invalid username or password!"
-            self.redirect(self.request.uri + "?error=" + tornado.escape.url_escape(error))
+            self.redirect(
+                self.request.uri + "?error=" + tornado.escape.url_escape(error)
+            )
 
     def _ldap_check(self, cfg: LDAPConfig, username: str, password: str) -> bool:
         server = self._server(cfg)

@@ -431,7 +431,9 @@ def _add_swatch_legend(fig, items):
     if not items:  # e.g. no partition covers this cycle's runs
         return
     for label, color in items:
-        fig.scatter(x=[], y=[], marker="square", size=8, color=color, legend_label=label)
+        fig.scatter(
+            x=[], y=[], marker="square", size=8, color=color, legend_label=label
+        )
     fig.legend.location = "top_right"
     fig.legend.label_text_font_size = "8px"
     fig.legend.glyph_height = 12
@@ -451,12 +453,10 @@ def exposure_cells(viewer, datatype="phy"):
     Active mass counts detectors with usability "on" at the run start. Runs
     without a runinfo entry (or without livetime, e.g. cal) contribute zero.
     """
-    cols, names, strings = _grid(viewer, datatype)
+    cols, names, _strings = _grid(viewer, datatype)
     statuses_db = viewer.status_db.statuses
 
-    cells = {
-        c: [] for c in ("x", "exposure", "cumulative", "mass", "livetime", "n_on")
-    }
+    cells = {c: [] for c in ("x", "exposure", "cumulative", "mass", "livetime", "n_on")}
     total = 0.0
     for period, run, start_key, livetime in cols:
         mass_kg = 0.0

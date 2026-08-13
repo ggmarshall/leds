@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import argparse
+from typing import ClassVar
 
 import ldap3
+import panel as pn
 import pytest
 from ldap3.core.exceptions import LDAPException
+from panel.auth import LOGOUT_TEMPLATE
 
+from leds.app import user_chip
+from leds.cli import _serve
 from leds.ldap_auth import LDAPAuthProvider, LDAPConfig, LDAPLoginHandler
 
 DIRECT_ENV = {
@@ -65,9 +70,9 @@ def test_from_env_invalid(overrides, match):
 class FakeConnection:
     """Stands in for ldap3.Connection; behaviour driven by class attrs."""
 
-    passwords = {}  # dn -> password accepted by bind()
-    search_results = {}  # search base -> list of entry DNs
-    instances = []
+    passwords: ClassVar[dict] = {}  # dn -> password accepted by bind()
+    search_results: ClassVar[dict] = {}  # search base -> list of entry DNs
+    instances: ClassVar[list] = []
 
     def __init__(self, server, user=None, password=None, **kwargs):
         self.server, self.user, self.password = server, user, password
@@ -220,7 +225,8 @@ def test_no_group_configured_skips_search(fake_ldap):
 # ---------------------------------------------------------------- errors
 
 
-def test_server_error_reports_unavailable(fake_ldap, monkeypatch, capsys):
+@pytest.mark.usefixtures("fake_ldap")
+def test_server_error_reports_unavailable(monkeypatch, capsys):
     def boom(*args, **kwargs):
         msg = "socket connection error"
         raise LDAPException(msg)
@@ -257,15 +263,11 @@ def serve_kwargs(monkeypatch):
     def fake_serve(_factory, **kwargs):
         captured.update(kwargs)
 
-    import panel
-
-    monkeypatch.setattr(panel, "serve", fake_serve)
+    monkeypatch.setattr(pn, "serve", fake_serve)
     return captured
 
 
 def test_cli_ldap_takes_precedence(serve_kwargs, monkeypatch, capsys):
-    from leds.cli import _serve
-
     for key, value in DIRECT_ENV.items():
         monkeypatch.setenv(key, value)
     _serve(serve_args(basic_auth="hunter2"))
@@ -278,8 +280,6 @@ def test_cli_ldap_takes_precedence(serve_kwargs, monkeypatch, capsys):
 
 
 def test_cli_basic_auth_unchanged(serve_kwargs, monkeypatch):
-    from leds.cli import _serve
-
     monkeypatch.delenv("LEDS_LDAP_SERVER", raising=False)
     _serve(serve_args(basic_auth="hunter2"))
 
@@ -289,8 +289,6 @@ def test_cli_basic_auth_unchanged(serve_kwargs, monkeypatch):
 
 
 def test_cli_no_auth(serve_kwargs, monkeypatch):
-    from leds.cli import _serve
-
     monkeypatch.delenv("LEDS_LDAP_SERVER", raising=False)
     _serve(serve_args())
 
@@ -303,10 +301,6 @@ def test_cli_no_auth(serve_kwargs, monkeypatch):
 
 
 def test_branded_logout_template_wired(serve_kwargs, monkeypatch):
-    from panel.auth import LOGOUT_TEMPLATE
-
-    from leds.cli import _serve
-
     for key, value in DIRECT_ENV.items():
         monkeypatch.setenv(key, value)
     _serve(serve_args())
@@ -318,16 +312,12 @@ def test_branded_logout_template_wired(serve_kwargs, monkeypatch):
 
 
 def test_cli_basic_auth_logout_template(serve_kwargs, monkeypatch):
-    from leds.cli import _serve
-
     monkeypatch.delenv("LEDS_LDAP_SERVER", raising=False)
     _serve(serve_args(basic_auth="hunter2"))
     assert serve_kwargs["logout_template"].endswith("logout.html")
 
 
 def test_user_chip():
-    from leds.app import user_chip
-
     chip = user_chip("ggmarshall")
     assert "ggmarshall" in chip
     assert 'href="./logout"' in chip

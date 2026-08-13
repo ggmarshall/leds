@@ -6,9 +6,8 @@ import awkward as ak
 import numpy as np
 import pytest
 
-from leds import validation
+from leds import validation_view
 from leds.validation import (
-    BASE_BIN_SECONDS,
     BIN_WIDTHS,
     K_LINES,
     ValidationData,
@@ -32,7 +31,7 @@ class FakeViewer:
     def available_runs(self):
         return self._runs
 
-    def _run_files(self, period, run):
+    def _run_files(self, _period, _run):
         return []
 
     def _run_tstamps(self, period, run):
@@ -60,11 +59,11 @@ def columns(t, **overrides):
 
 def make_data(columns_by_run, runs=None):
     """A ValidationData whose _columns serves the given synthetic columns."""
-    runs = runs or {"p01": dict.fromkeys(sorted(columns_by_run), ["ts"])}
+    runs = runs or {"p01": {run: ["ts"] for run in sorted(columns_by_run)}}
     data = ValidationData(FakeViewer(runs=runs))
-    data._columns = lambda period, run: columns_by_run[run]  # type: ignore[method-assign]
+    data._columns = lambda _period, run: columns_by_run[run]  # type: ignore[method-assign]
     # unit mass so rate expectations stay in plain Hz / counts-per-hour
-    data._mass_kg = lambda period, run, string=None: 1.0  # type: ignore[method-assign]
+    data._mass_kg = lambda _period, _run, _string=None: 1.0  # type: ignore[method-assign]
     return data
 
 
@@ -90,7 +89,8 @@ def test_constant_rate_flat_at_every_width(label):
     assert counts_of(data, "p01", "r001", ("trigger", "all triggers")) == t.size
     # base axis is day-aligned so every configured width divides it exactly
     edges = summary["exposure"].axes[0].edges
-    assert edges[0] % DAY == 0 and edges[-1] % DAY == 0
+    assert edges[0] % DAY == 0
+    assert edges[-1] % DAY == 0
     assert (edges[-1] - edges[0]) % BIN_WIDTHS[label] == 0
 
 
@@ -99,7 +99,7 @@ def test_rebin_needs_no_reread():
     data = make_data({"r001": columns(t)})
     data.period_series("p01", 900)
     data._columns = None  # any further read attempt would raise
-    times, rates = data.period_series("p01", 3600)  # served from the cache
+    _times, rates = data.period_series("p01", 3600)  # served from the cache
     assert np.isfinite(rates[("trigger", "all triggers")]).any()
 
 
@@ -181,8 +181,8 @@ def test_string_scoping_and_mass_normalisation():
         mult=np.array([1, 1, 2, 0], dtype=np.uint16),
     )
     data = ValidationData(FakeViewer(runs={"p01": {"r001": ["ts"]}}))
-    data._columns = lambda period, run: cols  # type: ignore[method-assign]
-    data._string_map = lambda period, run: (  # type: ignore[method-assign]
+    data._columns = lambda _period, _run: cols  # type: ignore[method-assign]
+    data._string_map = lambda _period, _run: (  # type: ignore[method-assign]
         {1: frozenset({101}), 2: frozenset({201})},
         {1: 2.0, 2: 4.0},
     )
@@ -287,9 +287,7 @@ def test_cal_curve_linear():
     np.testing.assert_allclose(curve["cal_mu"], curve["peaks"])  # perfect cal
     np.testing.assert_allclose(curve["residual"], 0.0, atol=1e-9)
     np.testing.assert_allclose(curve["cal_err"], 0.5 * curve["mu_err"])
-    np.testing.assert_allclose(
-        curve["line_y"], 0.5 * curve["line_x"], atol=1e-9
-    )
+    np.testing.assert_allclose(curve["line_y"], 0.5 * curve["line_x"], atol=1e-9)
 
 
 def test_cal_curve_no_valid_peaks():
@@ -301,10 +299,10 @@ def test_cal_curve_no_valid_peaks():
 
 
 def test_cal_residuals_order_and_nan():
-    pars = {**synthetic_pars(), **{"A99": synthetic_pars()["V01"]}}
+    pars = {**synthetic_pars(), "A99": synthetic_pars()["V01"]}
     names, residuals = cal_residuals(pars, ["V01", "A99", "NOPE"])
     assert names == ["V01", "A99"]
-    res, err = residuals[2614.511]
+    res, _err = residuals[2614.511]
     np.testing.assert_allclose(res, 0.0, atol=1e-9)
     res583, _ = residuals[583.191]
     assert np.isnan(res583).all()  # only invalid fits for that peak
@@ -327,7 +325,8 @@ def test_load_cal_pars_direct_validity_and_missing(tmp_path):
 
     # 1. the run's own par file wins
     pars, label = data.load_cal_pars("p01", "r001")
-    assert pars is not None and "V01" in pars
+    assert pars is not None
+    assert "V01" in pars
     assert label == "cal pars: p01 r001"
 
     # 2. no direct file -> resolved through validity.yaml at the start key
@@ -356,8 +355,6 @@ def test_load_cal_pars_direct_validity_and_missing(tmp_path):
 
 def test_view_builders_smoke():
     """The figure builders accept real period_series output."""
-    from leds import validation_view
-
     t = T0 + np.arange(0, 7200, 10.0)
     k40 = K_LINES["K40"]
     data = make_data(
