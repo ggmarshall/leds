@@ -28,6 +28,21 @@ def _free_port():
     return port
 
 
+def _cookie_secret(args):
+    """The signing secret for auth cookies, warning when it is ephemeral."""
+    import secrets  # noqa: PLC0415 (only needed when auth is enabled)
+
+    if args.cookie_secret:
+        return args.cookie_secret
+    print(  # noqa: T201 (intentional operator-facing CLI warning)
+        "leds: no --cookie-secret/$LEDS_COOKIE_SECRET set; using an "
+        "ephemeral one. Provide a fixed secret so logins survive "
+        "restarts and are shared across replicas.",
+        file=sys.stderr,
+    )
+    return secrets.token_hex(32)
+
+
 def _serve(args):
     """Long-running, multi-user hosted instance (Docker / NERSC spin)."""
     import panel as pn  # noqa: PLC0415 (lazy: keep panel off CLI startup)
@@ -40,28 +55,43 @@ def _serve(args):
         "show": False,
     }
 
-    # Optional login page. ``basic_auth`` is either a shared password or a path
-    # to a JSON file of {username: password}; both are typically injected by
-    # NERSC Spin as a secret (env var or mounted file).
-    if args.basic_auth:
-        import secrets  # noqa: PLC0415 (only needed when auth is enabled)
+    # Optional login page, two flavours. LDAP ($LEDS_LDAP_*) takes precedence;
+    # otherwise ``basic_auth`` is either a shared password or a path to a JSON
+    # file of {username: password}. Secrets are typically injected by NERSC
+    # Spin as env vars or mounted files.
+    from leds.ldap_auth import LDAPConfig  # noqa: PLC0415 (lazy import)
 
-        cookie_secret = args.cookie_secret or secrets.token_hex(32)
-        if not args.cookie_secret:
-            print(  # noqa: T201 (intentional operator-facing CLI warning)
-                "leds: no --cookie-secret/$LEDS_COOKIE_SECRET set; using an "
-                "ephemeral one. Provide a fixed secret so logins survive "
-                "restarts and are shared across replicas.",
-                file=sys.stderr,
-            )
+    ldap_cfg = LDAPConfig.from_env()  # None unless $LEDS_LDAP_SERVER is set
+
+    if ldap_cfg or args.basic_auth:
         import importlib.resources  # noqa: PLC0415 (only needed when auth is on)
 
-        serve_kwargs["basic_auth"] = args.basic_auth
-        serve_kwargs["cookie_secret"] = cookie_secret
-        # LEGEND-branded login page instead of Panel's default.
-        serve_kwargs["login_template"] = str(
-            importlib.resources.files("leds") / "templates" / "login.html"
+        serve_kwargs["cookie_secret"] = _cookie_secret(args)
+        # LEGEND-branded login/logout pages instead of Panel's defaults.
+        templates = importlib.resources.files("leds") / "templates"
+        login_template = str(templates / "login.html")
+        logout_template = str(templates / "logout.html")
+
+    if ldap_cfg:
+        if args.basic_auth:
+            print(  # noqa: T201 (intentional operator-facing CLI warning)
+                "leds: LEDS_LDAP_SERVER is set; ignoring "
+                "LEDS_BASIC_AUTH/--basic-auth.",
+                file=sys.stderr,
+            )
+        from leds.ldap_auth import LDAPAuthProvider  # noqa: PLC0415
+
+        # Note: must NOT also pass basic_auth/login_template to pn.serve, or
+        # Panel would build its own auth provider and clobber this one.
+        serve_kwargs["auth_provider"] = LDAPAuthProvider(
+            ldap_cfg,
+            login_template=login_template,
+            logout_template=logout_template,
         )
+    elif args.basic_auth:
+        serve_kwargs["basic_auth"] = args.basic_auth
+        serve_kwargs["login_template"] = login_template
+        serve_kwargs["logout_template"] = logout_template
 
     pn.serve(_bound_factory(args.base_path), **serve_kwargs)
 
@@ -116,7 +146,8 @@ def main(argv=None):
         "--basic-auth",
         default=os.environ.get("LEDS_BASIC_AUTH"),
         help="enable a login page; a shared password or a path to a JSON file "
-        "of {username: password} (default $LEDS_BASIC_AUTH)",
+        "of {username: password} (default $LEDS_BASIC_AUTH). Ignored when "
+        "LDAP login is configured via $LEDS_LDAP_SERVER",
     )
     serve.add_argument(
         "--cookie-secret",

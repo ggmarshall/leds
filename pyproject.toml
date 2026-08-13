@@ -33,13 +33,17 @@ dependencies = [
   "bokeh>=3.1.1",
   "matplotlib",
   "numpy",
-  "boost-histogram",
+  "awkward",
+  "pandas",
   "dbetto>=1.2.3",
   "pylegendmeta>=1.2.5",
-  "pygama",
   "dspeed",
   "legend-pydataobj",
   "legend-lh5io",
+  "ldap3>=2.9.1",
+  "certifi",
+  "numexpr",
+  "boost-histogram",
 ]
 
 [project.scripts]
@@ -86,6 +90,9 @@ addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
 xfail_strict = true
 filterwarnings = [
   "error",
+  # ldap3 2.9.1 still touches pyasn1's renamed tagMap/typeMap aliases
+  "ignore:tagMap is deprecated:DeprecationWarning",
+  "ignore:typeMap is deprecated:DeprecationWarning",
 ]
 log_cli_level = "INFO"
 testpaths = [
@@ -95,7 +102,7 @@ testpaths = [
 
 [tool.coverage]
 run.source = ["leds"]
-port.exclude_lines = [
+report.exclude_lines = [
   'pragma: no cover',
   '\.\.\.',
   'if typing.TYPE_CHECKING:',

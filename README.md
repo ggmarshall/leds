@@ -10,6 +10,84 @@
 ![License](https://img.shields.io/github/license/legend-exp/leds)
 [![Read the Docs](https://img.shields.io/readthedocs/leds?logo=readthedocs)](https://leds.readthedocs.io)
 
-An event viewer for the LEGEND experiment.
+An event viewer for the LEGEND experiment: a [Panel](https://panel.holoviz.org)
+dashboard with event display, waveforms, spectra, dataset-metadata and
+validation views over a legend-dataflow production cycle.
 
-_Work in progress..._
+## Running
+
+```bash
+pip install leds   # or: uv pip install .
+
+leds app /path/to/production_cycle          # local single-user browser tab
+leds app --desktop /path/to/cycle           # native window (needs leds[desktop])
+leds serve /path/to/cycle --port 5006       # hosted multi-user server
+```
+
+The production-cycle path (a directory containing `dataflow-config.yaml`, or a
+directory of such cycles) can also come from `$LEDS_BASE_PATH`; several paths
+may be listed separated by `:`.
+
+## Deployment (NERSC Spin)
+
+The `Dockerfile` builds a slim two-stage image by cloning this repository:
+
+```bash
+docker build -t registry.nersc.gov/<project>/leds:latest \
+  --build-arg LEDS_REPO=https://github.com/legend-exp/leds.git \
+  --build-arg LEDS_REF=main .
+docker push registry.nersc.gov/<project>/leds:latest
+```
+
+(Point `LEDS_REPO` at a fork while changes are not upstream yet.) The container
+listens on port 5006 and runs under an arbitrary non-root UID, as Spin requires.
+
+### Service environment
+
+| Variable                | Required       | Meaning                                                                                   |
+| ----------------------- | -------------- | ----------------------------------------------------------------------------------------- |
+| `LEDS_BASE_PATH`        | yes            | production cycle(s) on the mounted filesystem (e.g. CFS)                                  |
+| `BOKEH_ALLOW_WS_ORIGIN` | yes            | public hostname (`host[:port]`) allowed to open the websocket, i.e. the Spin ingress name |
+| `NUM_PROCS`             | no (default 2) | Panel worker processes; sessions in one process share an event loop                       |
+
+### Login (Spin secrets)
+
+Without any of the variables below the server is open. In all authenticated
+setups set a **fixed** `LEDS_COOKIE_SECRET` — with an ephemeral one, logins
+break on every restart and across the `NUM_PROCS` workers.
+
+**Option A — shared password / user list:** set `LEDS_BASIC_AUTH` to either a
+single shared password or a path to a mounted JSON file of
+`{"username": "password"}`.
+
+**Option B — LDAP (takes precedence over `LEDS_BASIC_AUTH`):** users sign in
+with their directory credentials. Fill the values in from the LEGEND LDAP
+administrators:
+
+| Variable                                        | Required                        | Meaning                                                                             |
+| ----------------------------------------------- | ------------------------------- | ----------------------------------------------------------------------------------- |
+| `LEDS_LDAP_SERVER`                              | yes (enables LDAP)              | e.g. `ldaps://ldap.legend.example:636`                                              |
+| `LEDS_LDAP_USER_DN_TEMPLATE`                    | direct-bind mode                | e.g. `uid={username},ou=people,dc=legend,dc=example`                                |
+| `LEDS_LDAP_BIND_DN` / `LEDS_LDAP_BIND_PASSWORD` | search-bind mode                | read-only service account (as a Spin secret)                                        |
+| `LEDS_LDAP_SEARCH_BASE`                         | search-bind mode                | subtree searched for the user entry                                                 |
+| `LEDS_LDAP_USER_FILTER`                         | no (default `(uid={username})`) | search filter template                                                              |
+| `LEDS_LDAP_GROUP_DN`                            | no                              | if set, only members (`member`/`uniqueMember`/`memberUid`) of this group may log in |
+| `LEDS_LDAP_STARTTLS`                            | no                              | `1` upgrades an `ldap://` connection via StartTLS                                   |
+| `LEDS_LDAP_CA_FILE`                             | no                              | CA bundle path (mount as a secret); defaults to certifi's bundle                    |
+
+Configure **either** `LEDS_LDAP_USER_DN_TEMPLATE` (direct bind) **or** the three
+search-bind variables; if both are present, direct bind wins. Server
+certificates are always verified. Bad credentials, unknown users and non-members
+all get the same generic login error; infrastructure failures are reported as
+"authentication service unavailable" with details in the container log only.
+
+To try the LDAP flow locally against a throwaway directory:
+
+```bash
+docker run --rm -d -p 1389:1389 -e LDAP_ADMIN_PASSWORD=adminpw \
+  -e LDAP_USERS=alice -e LDAP_PASSWORDS=alicepw bitnamilegacy/openldap
+
+LEDS_LDAP_SERVER=ldap://localhost:1389 \
+LEDS_LDAP_USER_DN_TEMPLATE="cn={username},ou=users,dc=example,dc=org" \
+LEDS_COOKIE_SECRET=devsecret leds serve /path/to/cycle
+```
