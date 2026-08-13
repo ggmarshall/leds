@@ -1022,6 +1022,11 @@ def create_app(base_path=None):
     header_items = [pn.HSpacer(), build_header_links()]
     chip = user_chip(pn.state.user)
     if chip is not None:
-        header_items.append(pn.pane.HTML(chip, margin=(0, 5, 0, 15)))
+        # clear separation from the resource icons on the left and the
+        # template's theme toggle on the right
+        header_items += [
+            pn.Spacer(width=40),
+            pn.pane.HTML(chip, align="center", margin=(0, 20, 0, 0)),
+        ]
     template.header.append(pn.Row(*header_items, sizing_mode="stretch_width"))
     return template
