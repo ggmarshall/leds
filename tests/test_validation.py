@@ -27,6 +27,8 @@ class FakeViewer:
         self._runs = runs or {}
         self.paths = paths or {}
         self.status_db = SimpleNamespace(runinfo=runinfo or {})
+        # distinct per instance, so two fakes never share a shared-cache entry
+        self.cycle_key = f"fake-viewer-{id(self)}"
 
     def available_runs(self):
         return self._runs

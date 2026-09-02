@@ -40,7 +40,22 @@ ENV PATH="/opt/venv/bin:$PATH" \
 #                         var directly; required when proxied behind Spin's LB.
 #   NUM_PROCS             Panel server processes. Sessions in one process share
 #                         its event loop, so one user's blocking file read
-#                         stalls the others; more processes isolate them.
+#                         stalls the others; more processes isolate them. They
+#                         do NOT share caches, so the memory bounds below are
+#                         per process -- multiply by this when sizing limits.
+#   LEDS_PREWARM          build the newest channelmap before forking, so each
+#                         worker's first session is warm (delays listening).
+#   LEDS_CACHE_TTL        seconds before metadata-derived caches are re-read
+#                         (default 3600); bounds how stale an updated metadata
+#                         checkout can be without a restart.
+#   LEDS_SCAN_TTL         seconds before directory scans are redone (300).
+#   LEDS_MAX_CACHED_RUN_SPECTRA
+#                         whole runs of per-hit energies held per worker (4).
+#                         The dominant memory line -- lower it if the container
+#                         is tight, raise it if users hop between runs.
+#   LEDS_MAX_CACHED_CAL_PARS
+#                         parsed par_hit calibration files held per worker (4);
+#                         MB-scale each.
 #
 # Login (all optional; secrets should come from Spin secrets, not the image):
 #   LEDS_COOKIE_SECRET    signs the auth cookie; set a fixed value so logins

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.resources
+from contextlib import contextmanager
 
 import numpy as np
 import pandas as pd
@@ -30,7 +31,9 @@ from leds.event_viewer import EventViewer, parse_timestamp
 from leds.spectrum import (
     BINARY_CUTS,
     DEFAULT_BIN_WIDTH,
+    ENERGY_RANGE,
     MULT_OPTIONS,
+    N_BINS,
     RunSpectrum,
     bins_for_width,
 )
@@ -98,6 +101,21 @@ def user_chip(user):
         "border:1px solid #1a2a5b;border-radius:4px;padding:4px 12px;"
         'text-decoration:none;font-size:0.95em;">Log out</a></span>'
     )
+
+
+def _update_energy(source, data):
+    """Send only the ``energy`` column when the rest of ``data`` is unchanged.
+
+    Falls back to a full assignment whenever the column lengths disagree --
+    ``patch`` requires them to match, and a changed detector count means the
+    static geometry changed too.
+    """
+    energies = data["energy"]
+    current = source.data.get("energy")
+    if current is not None and len(current) == len(energies):
+        source.patch({"energy": [(slice(len(energies)), list(energies))]})
+    else:
+        source.data = data
 
 
 def build_header_links():
@@ -201,6 +219,8 @@ class EventDisplay(param.Parameterized):
         # guards our own data watchers while params are updated internally
         # (widget syncing still sees the events)
         self._internal_change = False
+        # set while one action re-points several all-waveforms params at once
+        self._suspend_all_wf = False
         super().__init__(**params)
 
         self.geds_source = empty_source()
@@ -266,6 +286,9 @@ class EventDisplay(param.Parameterized):
                 name="Bin width (keV)",
                 step=0.1,
                 width=240,
+                # only re-histogram on mouse-up: an unthrottled drag re-cuts and
+                # re-flattens the whole run once per intermediate step
+                throttled=True,
             ),
             pn.Row(
                 self._cut_column("geds_trigger"),
@@ -333,6 +356,7 @@ class EventDisplay(param.Parameterized):
 
         self.validation_pane = pn.pane.Bokeh(sizing_mode="stretch_width")
         self._validation_figs: dict = {}  # per-period/plot figures, per cycle
+        self._cal_cache: dict = {}  # (cycle, period, run) -> calibration residuals
         self.validation_bin_select = pn.widgets.Select.from_param(
             self.param.validation_bin_width, name="Bin width", width=90
         )
@@ -372,6 +396,8 @@ class EventDisplay(param.Parameterized):
         )
 
         def _on_tab(_e):
+            # each updater self-gates on the active tab and on whether anything
+            # it draws has actually changed, so this is one rebuild at most
             self._update_all_waveforms()
             self._update_run_spectrum()
             self._update_event_details()
@@ -405,8 +431,41 @@ class EventDisplay(param.Parameterized):
         self._playback_cb = None
         self._run_length = None
 
-        self._apply_period()
+        # last state each tab was drawn for; see _tab_is_current
+        self._tab_state: dict = {}
+
+        # channelmap the event sources' static columns were built for
+        self._source_tstamp = None
+
+        # running accumulating-spectrum counts; see _accumulated_histogram
+        self._accum_scope = None
+        self._accum_index = None
+        self._accum_counts = None
+
+        self._apply_period(defer=True)
         self._relayout()
+        # hand the page over first, then read event 0
+        # (the spinner goes on the row, not the Bokeh pane: setting `loading`
+        # on a Bokeh pane inside a template raises in Panel 1.9's
+        # _sync_properties, which would abort the rest of __init__)
+        self.main_row.loading = True
+        pn.state.onload(self._first_render)
+
+    def _tab_is_current(self, tab, key):
+        """True when ``tab`` is already drawn for exactly this state.
+
+        Cheaper and far less error-prone than invalidating on every mutation:
+        each updater declares what it draws from, and re-drawing is skipped
+        while that is unchanged. Switching away and back is then free, and a
+        forgotten invalidation point cannot leave a stale pane on screen.
+
+        The state is only recorded once the draw succeeds (``_tab_drawn``), so
+        a failed build is retried rather than remembered as done.
+        """
+        return self._tab_state.get(tab) == key
+
+    def _tab_drawn(self, tab, key):
+        self._tab_state[tab] = key
 
     # -- reactive plumbing ----------------------------------------------------
     #
@@ -434,13 +493,33 @@ class EventDisplay(param.Parameterized):
         finally:
             self._internal_change = False
 
-    def _apply_period(self):
-        """Refresh the run options for the current period and load its event 0."""
+    def _apply_period(self, *, defer=False):
+        """Refresh the run options for the current period and load its event 0.
+
+        With ``defer`` the run options -- cheap, and needed for the sidebar to
+        be right in the first paint -- are set inline, while the event read is
+        left to :meth:`_first_render`.
+        """
         runs = sorted(self.runs.get(self.period, {}))
         self.param.run.objects = runs
         run = self.run if self.run in runs else (runs[0] if runs else None)
         self._set_quietly(run=run, index=0)
-        self._after_data_change()
+        if not defer:
+            self._after_data_change()
+
+    def _first_render(self):
+        """The initial event read, run once the page has been delivered.
+
+        Everything the layout needs is already built by ``__init__``; only the
+        data is outstanding. Deferring it means the user sees the dashboard
+        (with a spinner on the array) instead of a blank tab while the first
+        event is read. Outside a server context ``pn.state.onload`` fires
+        immediately, so local runs and tests are unaffected.
+        """
+        try:
+            self._after_data_change()
+        finally:
+            self.main_row.loading = False
 
     def _after_data_change(self):
         """Single render + dependent refreshes after a period/run/cycle change."""
@@ -463,6 +542,8 @@ class EventDisplay(param.Parameterized):
         self.validation_data = validation.ValidationData(self.viewer)
         self._dataset_figs.clear()
         self._validation_figs.clear()
+        self._cal_cache.clear()
+        self._tab_state.clear()
         self._update_dataset()
         periods = sorted(self.runs)
         self.param.period.objects = periods
@@ -505,16 +586,31 @@ class EventDisplay(param.Parameterized):
         try:
             self.viewer.get_event(self.period, self.run, self.index)
             geds_data = build_source_data(self.viewer)
-            self.geds_source.data = geds_data
-            self.figure.title.text = (
-                f"{self.viewer.period} {self.viewer.run} {self.index} "
-                f"- {self.viewer.event_timestamp}"
-            )
-            self.sipm_source.data = sipm_view.build_source_data(self.viewer, geds_data)
-            labels = sipm_view.row_label_map(geds_data)
-            self.figure.yaxis.ticker = FixedTicker(ticks=list(labels))
-            self.figure.yaxis.major_label_overrides = labels
-            self._refresh_all_wf_categories()
+            sipm_data = sipm_view.build_source_data(self.viewer, geds_data)
+            # Only the energies change from event to event; the polygon
+            # geometry and per-detector metadata are fixed by the channelmap.
+            # Re-sending all of it every event costs ~80x the bytes, and the
+            # ticker below would rebuild a Bokeh model for labels that did not
+            # move. One hold() so both sources land in a single document patch.
+            with pn.io.hold():
+                if self._source_tstamp == self.viewer.tstamp:
+                    _update_energy(self.geds_source, geds_data)
+                    _update_energy(self.sipm_source, sipm_data)
+                else:
+                    self.geds_source.data = geds_data
+                    self.sipm_source.data = sipm_data
+                    labels = sipm_view.row_label_map(geds_data)
+                    self.figure.yaxis.ticker = FixedTicker(ticks=list(labels))
+                    self.figure.yaxis.major_label_overrides = labels
+                    self._source_tstamp = self.viewer.tstamp
+                self.figure.title.text = (
+                    f"{self.viewer.period} {self.viewer.run} {self.index} "
+                    f"- {self.viewer.event_timestamp}"
+                )
+            # the category refresh can re-point all_wf_category and fire its own
+            # watcher; suspend it so the explicit rebuild below happens once
+            with self._all_wf_batch():
+                self._refresh_all_wf_categories()
             self._update_waveforms()
             self._update_spectrum()
             self._update_all_waveforms()
@@ -544,14 +640,46 @@ class EventDisplay(param.Parameterized):
         ):
             return
         try:
-            counts, edges = self.run_spectrum.histogram(
-                self.period, self.run, upto_index=self.index
-            )
+            counts, edges = self._accumulated_histogram()
         except (KeyError, FileNotFoundError, OSError, IndexError) as exc:
             self.message.object = f"**spectrum:** {type(exc).__name__}: {exc}"
             self.message.visible = True
             return
         self.spectrum_source.data = spectrum_view.source_data(counts, edges)
+
+    def _accumulated_histogram(self):
+        """Counts of every geds hit up to the current event.
+
+        Playback walks the run one event at a time, so the common case is
+        "same run, index advanced by one" -- add just that event's hits to the
+        running counts instead of re-reducing the whole run every frame, which
+        is what caps playback speed on a long run.
+        """
+        edges = np.histogram_bin_edges([], bins=N_BINS, range=ENERGY_RANGE)
+        scope = (self.production_cycle, self.period, self.run)
+        previous = self._accum_index
+        if (
+            scope == self._accum_scope
+            and previous is not None
+            and self.index > previous
+        ):
+            new = self.run_spectrum.hits_between(
+                self.period, self.run, previous + 1, self.index
+            )
+            if new is not None:
+                self._accum_counts += np.histogram(
+                    new, bins=N_BINS, range=ENERGY_RANGE
+                )[0]
+                self._accum_index = self.index
+                return self._accum_counts, edges
+
+        counts, edges = self.run_spectrum.histogram(
+            self.period, self.run, upto_index=self.index
+        )
+        self._accum_scope = scope
+        self._accum_index = self.index
+        self._accum_counts = counts
+        return counts, edges
 
     def _update_event_details(self):
         if (
@@ -560,10 +688,14 @@ class EventDisplay(param.Parameterized):
             or self.viewer.chmap is None
         ):
             return
+        key = (self.production_cycle, self.period, self.run, self.index)
+        if self._tab_is_current(TAB_DETAILS, key):
+            return
         tables = event_details.read_tables(self.viewer)
         self.summary_table.value = event_details.summary_dataframe(self.viewer, tables)
         for name, table in self.detail_tables.items():
             table.value = event_details.table_dataframe(tables, name)
+        self._tab_drawn(TAB_DETAILS, key)
 
     def _cut_column(self, key):
         """A labelled column with the two checkboxes for one binary cut."""
@@ -594,11 +726,21 @@ class EventDisplay(param.Parameterized):
             or not self.run
         ):
             return
+        cuts = self._cuts()
+        key = (
+            self.production_cycle,
+            self.period,
+            self.run,
+            self.spectrum_bin_width,
+            tuple(sorted(cuts.items())),
+        )
+        if self._tab_is_current(TAB_SPECTRUM, key):
+            return
         try:
             counts, edges = self.run_spectrum.histogram(
                 self.period,
                 self.run,
-                cuts=self._cuts(),
+                cuts=cuts,
                 bins=bins_for_width(self.spectrum_bin_width),
             )
         except (KeyError, FileNotFoundError, OSError, IndexError) as exc:
@@ -606,6 +748,7 @@ class EventDisplay(param.Parameterized):
             self.message.visible = True
             return
         self.run_spectrum_source.data = spectrum_view.source_data(counts, edges)
+        self._tab_drawn(TAB_SPECTRUM, key)
 
     @param.depends(
         "spectrum_bin_width",
@@ -655,16 +798,29 @@ class EventDisplay(param.Parameterized):
 
     @param.depends("all_wf_system", watch=True)
     def _on_all_wf_system(self):
-        groupings = groupings_for(self.all_wf_system)
-        self.param.all_wf_grouping.objects = groupings
-        if self.all_wf_grouping not in groupings:
-            self.all_wf_grouping = groupings[0]
-        kinds = raw_kinds_for(self.all_wf_system)
-        self.param.all_wf_kind.objects = kinds
-        if self.all_wf_kind not in kinds:
-            self.all_wf_kind = kinds[0]
-        self._refresh_all_wf_categories()
+        # switching system re-points grouping, kind and category; each has its
+        # own watcher, so suspend them and rebuild once at the end -- otherwise
+        # one dropdown change costs three ~100-channel reads
+        with self._all_wf_batch():
+            groupings = groupings_for(self.all_wf_system)
+            self.param.all_wf_grouping.objects = groupings
+            if self.all_wf_grouping not in groupings:
+                self.all_wf_grouping = groupings[0]
+            kinds = raw_kinds_for(self.all_wf_system)
+            self.param.all_wf_kind.objects = kinds
+            if self.all_wf_kind not in kinds:
+                self.all_wf_kind = kinds[0]
+            self._refresh_all_wf_categories()
         self._update_all_waveforms()
+
+    @contextmanager
+    def _all_wf_batch(self):
+        """Coalesce the all-waveforms watchers into one rebuild by the caller."""
+        self._suspend_all_wf = True
+        try:
+            yield
+        finally:
+            self._suspend_all_wf = False
 
     def _refresh_all_wf_categories(self):
         if self.viewer is None or self.viewer.chmap is None:
@@ -679,10 +835,26 @@ class EventDisplay(param.Parameterized):
     def _update_all_waveforms(self):
         # only the active "All waveforms" tab, to avoid 60 reads per playback step
         if (
-            self.tabs.active != TAB_WAVEFORMS
+            self._suspend_all_wf
+            or self.tabs.active != TAB_WAVEFORMS
             or self.viewer is None
             or self.viewer.chmap is None
         ):
+            return
+        key = (
+            self.production_cycle,
+            self.period,
+            self.run,
+            self.index,
+            self.all_wf_system,
+            self.all_wf_grouping,
+            self.all_wf_category,
+            self.all_wf_exploded,
+            self.all_wf_kind,
+            self.waveform_param,
+            self.subtract_baseline,
+        )
+        if self._tab_is_current(TAB_WAVEFORMS, key):
             return
         self.all_wf_pane.object = plot_all_waveforms(
             self.viewer,
@@ -704,6 +876,7 @@ class EventDisplay(param.Parameterized):
             self.all_wf_area[:] = [self.all_wf_ylabel, self.all_wf_pane]
         else:
             self.all_wf_area[:] = [self.all_wf_pane]
+        self._tab_drawn(TAB_WAVEFORMS, key)
 
     def _update_dataset(self):
         # metadata matrices are static per cycle, so build lazily and cache
@@ -713,6 +886,8 @@ class EventDisplay(param.Parameterized):
         all_datatypes = self.dataset_plot == "data"
         self.dataset_datatype_select.disabled = all_datatypes
         key = ("all" if all_datatypes else self.dataset_datatype, self.dataset_plot)
+        if self._tab_is_current(TAB_DATASET, (self.production_cycle, key)):
+            return  # already on screen; re-assigning re-serialises the figure
         fig = self._dataset_figs.get(key)
         if fig is None:
             try:
@@ -730,6 +905,7 @@ class EventDisplay(param.Parameterized):
             )
             self._dataset_figs[key] = fig
         self.dataset_pane.object = fig
+        self._tab_drawn(TAB_DATASET, (self.production_cycle, key))
 
     def _on_dataset_tap(self, source, new):
         if not new:
@@ -763,6 +939,8 @@ class EventDisplay(param.Parameterized):
         self.validation_detector_select.visible = plot == "calibration detail"
         if not is_cal:
             self._refresh_validation_strings()
+        if self._tab_is_current(TAB_VALIDATION, self._validation_state()):
+            return
         try:
             fig = self._validation_figure(plot)
         except (KeyError, ValueError, FileNotFoundError, OSError) as exc:
@@ -771,6 +949,22 @@ class EventDisplay(param.Parameterized):
             return
         if fig is not None:
             self.validation_pane.object = fig
+            # re-read the state: building a calibration plot can re-point
+            # validation_detector at the run's first detector
+            self._tab_drawn(TAB_VALIDATION, self._validation_state())
+
+    def _validation_state(self):
+        """Everything the validation pane is drawn from."""
+        return (
+            self.production_cycle,
+            self.period,
+            self.run,
+            self.validation_plot,
+            self.validation_bin_width,
+            self.validation_log_y,
+            self.validation_string,
+            self.validation_detector,
+        )
 
     def _validation_figure(self, plot):
         """Build (or fetch from cache) the requested validation figure."""
@@ -805,19 +999,14 @@ class EventDisplay(param.Parameterized):
                 )
             return self._cache_validation_fig(key, fig)
 
-        # calibration plots: resolve the par_hit file for the selected run
-        pars, label = self.validation_data.load_cal_pars(self.period, self.run)
-        if pars is None:
-            self.message.object = f"**validation:** {label}"
-            self.message.visible = True
+        # calibration plots: the run's residuals are ~100 numexpr evaluations
+        # and are needed to populate the detector selector, so they are cached
+        # per run -- otherwise merely picking a different detector recomputes
+        # them all, even when the figure itself is already cached
+        cal = self._cal_data()
+        if cal is None:
             return None
-        names, residuals, strings = self._cal_residuals(pars)
-        if not names:
-            self.message.object = (
-                f"**validation:** no usable energy-calibration results in {label}"
-            )
-            self.message.visible = True
-            return None
+        names, residuals, strings, label = cal
         self.param.validation_detector.objects = names
         if self.validation_detector not in names:
             self._set_quietly(validation_detector=names[0])
@@ -831,9 +1020,37 @@ class EventDisplay(param.Parameterized):
             key = (self.period, self.run, plot, self.validation_detector)
             fig = self._validation_figs.get(key)
             if fig is None:
+                pars, _label = self.validation_data.load_cal_pars(self.period, self.run)
                 curve = validation.cal_curve(pars, self.validation_detector)
                 fig = validation_view.cal_detail(curve, self.validation_detector, label)
         return self._cache_validation_fig(key, fig)
+
+    def _cal_data(self):
+        """``(names, residuals, strings, label)`` for the run, cached.
+
+        ``None`` (with the reason shown) when the run has no usable
+        energy-calibration results.
+        """
+        key = (self.production_cycle, self.period, self.run)
+        cached = self._cal_cache.pop(key, None)  # re-inserted below (LRU order)
+        if cached is None:
+            pars, label = self.validation_data.load_cal_pars(self.period, self.run)
+            if pars is None:
+                self.message.object = f"**validation:** {label}"
+                self.message.visible = True
+                return None
+            names, residuals, strings = self._cal_residuals(pars)
+            if not names:
+                self.message.object = (
+                    f"**validation:** no usable energy-calibration results in {label}"
+                )
+                self.message.visible = True
+                return None
+            cached = (names, residuals, strings, label)
+        self._cal_cache[key] = cached
+        while len(self._cal_cache) > 4:
+            self._cal_cache.pop(next(iter(self._cal_cache)))
+        return cached
 
     def _refresh_validation_strings(self):
         """Offer the period's strings in the scope selector."""
@@ -988,7 +1205,11 @@ class EventDisplay(param.Parameterized):
             self.find_button,
             pn.Row(self.play_toggle),
             pn.widgets.IntSlider.from_param(
-                self.param.playback_period, name="Playback interval (ms)"
+                self.param.playback_period,
+                name="Playback interval (ms)",
+                # each intermediate value would otherwise tear down and
+                # re-register the periodic callback
+                throttled=True,
             ),
             pn.widgets.Checkbox.from_param(
                 self.param.show_spectrum, name="Show spectrum"
