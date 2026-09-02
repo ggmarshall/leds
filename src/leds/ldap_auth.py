@@ -206,8 +206,11 @@ class LDAPLoginHandler(BasicLoginHandler):
         conn = ldap3.Connection(
             server, user=user_dn, password=password, receive_timeout=_TIMEOUT
         )
-        if cfg.starttls:
-            conn.start_tls()
+        if cfg.starttls and not conn.start_tls():
+            # never fall through to a plaintext bind on a failed negotiation
+            conn.unbind()
+            msg = "LDAP StartTLS negotiation failed"
+            raise LDAPException(msg)
         if not conn.bind():
             conn.unbind()
             return None

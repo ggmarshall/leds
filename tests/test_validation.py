@@ -214,6 +214,13 @@ def test_string_scoping_and_mass_normalisation():
     np.testing.assert_allclose(ratio[~np.isnan(ratio)], 1.5)
 
 
+def test_period_series_rejects_bad_bin_seconds():
+    data = make_data({"r001": columns(T0 + np.arange(0.0, 60.0, 10.0))})
+    for bad in (0, 450, 900 + 1, -3600):
+        with pytest.raises(ValueError, match="multiple"):
+            data.period_series("p01", bad)
+
+
 def test_survival_fraction():
     p = np.array([9.0, 0.0, 0.0, np.nan])
     f = np.array([1.0, 2.0, 0.0, np.nan])

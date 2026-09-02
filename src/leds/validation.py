@@ -329,6 +329,12 @@ class ValidationData:
         channelmap). Rebinned from the cached base-resolution summaries; no
         file is re-read when ``bin_seconds`` changes.
         """
+        if bin_seconds < BASE_BIN_SECONDS or bin_seconds % BASE_BIN_SECONDS:
+            msg = (
+                f"bin_seconds must be a positive multiple of {BASE_BIN_SECONDS}, "
+                f"got {bin_seconds}"
+            )
+            raise ValueError(msg)
         factor = bin_seconds // BASE_BIN_SECONDS
         all_keys = [(g, lbl) for g, labels in RATE_GROUPS.items() for lbl in labels]
         times: list[np.ndarray] = []

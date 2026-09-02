@@ -71,6 +71,7 @@ class FakeConnection:
     """Stands in for ldap3.Connection; behaviour driven by class attrs."""
 
     passwords: ClassVar[dict] = {}  # dn -> password accepted by bind()
+    start_tls_ok: ClassVar[bool] = True
     search_results: ClassVar[dict] = {}  # search base -> list of entry DNs
     instances: ClassVar[list] = []
 
@@ -86,6 +87,7 @@ class FakeConnection:
 
     def start_tls(self):
         self.started_tls = True
+        return self.start_tls_ok
 
     def bind(self):
         self.bound = self.passwords.get(self.user) == self.password
@@ -108,6 +110,7 @@ class FakeEntry:
 @pytest.fixture
 def fake_ldap(monkeypatch):
     FakeConnection.passwords = {}
+    FakeConnection.start_tls_ok = True
     FakeConnection.search_results = {}
     FakeConnection.instances = []
     monkeypatch.setattr(ldap3, "Connection", FakeConnection)
@@ -223,6 +226,22 @@ def test_no_group_configured_skips_search(fake_ldap):
 
 
 # ---------------------------------------------------------------- errors
+
+
+def test_failed_starttls_never_reaches_bind(fake_ldap, capsys):
+    # a failed StartTLS negotiation must abort, not bind over plaintext
+    fake_ldap.passwords = {"uid=alice,ou=people,dc=example,dc=org": "pw"}
+    fake_ldap.start_tls_ok = False
+    env = {
+        **DIRECT_ENV,
+        "LEDS_LDAP_SERVER": "ldap://ldap.example:389",
+        "LEDS_LDAP_STARTTLS": "1",
+    }
+    handler = make_handler(env)
+    assert handler._validate("alice", "pw") is False
+    assert handler._auth_error == LDAPLoginHandler._AUTH_UNAVAILABLE
+    assert "StartTLS" in capsys.readouterr().err
+    assert not any(c.bound for c in fake_ldap.instances)
 
 
 @pytest.mark.usefixtures("fake_ldap")
