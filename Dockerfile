@@ -30,7 +30,9 @@ ENV PATH="/opt/venv/bin:$PATH" \
     HOME=/tmp \
     PYTHONUNBUFFERED=1 \
     PORT=5006 \
-    NUM_PROCS=2
+    NUM_PROCS=2 \
+    NUM_THREADS=4 \
+    LEDS_PREWARM=1
 
 # Runtime configuration is supplied by the Spin service, not baked in:
 #   LEDS_BASE_PATH        production-cycle directory (a mounted NERSC global
@@ -39,12 +41,17 @@ ENV PATH="/opt/venv/bin:$PATH" \
 #                         websocket (the Spin hostname). Bokeh reads this env
 #                         var directly; required when proxied behind Spin's LB.
 #   NUM_PROCS             Panel server processes. Sessions in one process share
-#                         its event loop, so one user's blocking file read
-#                         stalls the others; more processes isolate them. They
-#                         do NOT share caches, so the memory bounds below are
-#                         per process -- multiply by this when sizing limits.
+#                         its caches; processes do NOT, so the memory bounds
+#                         below are per process -- multiply by this when
+#                         sizing limits. HDF5 reads serialise within a process,
+#                         so this is also what parallelises them.
+#   NUM_THREADS           thread pool per process that callbacks run on, so one
+#                         session's slow read leaves the other sessions' UI
+#                         responsive (0 = everything on the event loop).
 #   LEDS_PREWARM          build the newest channelmap before forking, so each
-#                         worker's first session is warm (delays listening).
+#                         worker's first session is warm. On by default; it
+#                         delays the listening socket, so allow for it in any
+#                         readiness probe (set to 0 to turn off).
 #   LEDS_CACHE_TTL        seconds before metadata-derived caches are re-read
 #                         (default 3600); bounds how stale an updated metadata
 #                         checkout can be without a restart.
@@ -75,4 +82,4 @@ ENV PATH="/opt/venv/bin:$PATH" \
 #     LEDS_LDAP_CA_FILE   CA bundle path (e.g. a mounted secret); defaults to
 #                         certifi's bundle.
 EXPOSE 5006
-CMD ["sh", "-c", "leds serve --address 0.0.0.0 --port ${PORT} --num-procs ${NUM_PROCS}"]
+CMD ["sh", "-c", "leds serve --address 0.0.0.0 --port ${PORT} --num-procs ${NUM_PROCS} --num-threads ${NUM_THREADS}"]

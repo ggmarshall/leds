@@ -124,6 +124,14 @@ def _serve(args):
         serve_kwargs["login_template"] = login_template
         serve_kwargs["logout_template"] = logout_template
 
+    if args.num_threads:
+        # run callbacks on a thread pool so one session's blocking read does
+        # not stall every other session in the worker; see "Threads" in the
+        # README for what this does and does not buy. Set before pn.serve
+        # forks: the pool spawns its threads lazily, so the children inherit
+        # only the configuration, never a live thread.
+        pn.config.nthreads = args.num_threads
+
     factory = _bound_factory(args.base_path)  # imports leds.app before forking
     if args.prewarm:
         _prewarm(args.base_path)
@@ -171,6 +179,14 @@ def main(argv=None):
     serve.add_argument("--address", default="0.0.0.0")
     serve.add_argument("--port", type=int, default=5006)
     serve.add_argument("--num-procs", type=int, default=1)
+    serve.add_argument(
+        "--num-threads",
+        type=int,
+        default=int(os.environ.get("LEDS_NUM_THREADS") or 0),
+        help="size of the thread pool callbacks run on, so one session's slow "
+        "read does not freeze the others in its process; 0 keeps everything "
+        "on the event loop (default $LEDS_NUM_THREADS or 0)",
+    )
     serve.add_argument(
         "--prewarm",
         action="store_true",

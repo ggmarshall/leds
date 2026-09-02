@@ -253,6 +253,7 @@ def serve_args(**overrides):
         "cookie_secret": "s3cret",
         "base_path": None,
         "prewarm": False,
+        "num_threads": 0,
     }
     return argparse.Namespace(**{**defaults, **overrides})
 
@@ -296,6 +297,24 @@ def test_cli_no_auth(serve_kwargs, monkeypatch):
     assert "auth_provider" not in serve_kwargs
     assert "basic_auth" not in serve_kwargs
     assert "cookie_secret" not in serve_kwargs
+
+
+@pytest.mark.usefixtures("serve_kwargs")
+def test_cli_num_threads_enables_the_thread_pool(monkeypatch):
+    monkeypatch.delenv("LEDS_LDAP_SERVER", raising=False)
+    monkeypatch.setattr(pn.config, "nthreads", None)
+    _serve(serve_args(num_threads=3))
+
+    assert pn.config.nthreads == 3
+
+
+@pytest.mark.usefixtures("serve_kwargs")
+def test_cli_threads_off_by_default(monkeypatch):
+    monkeypatch.delenv("LEDS_LDAP_SERVER", raising=False)
+    monkeypatch.setattr(pn.config, "nthreads", None)
+    _serve(serve_args())
+
+    assert pn.config.nthreads is None
 
 
 # ---------------------------------------------------------------- logout/header

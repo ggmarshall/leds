@@ -44,16 +44,17 @@ listens on port 5006 and runs under an arbitrary non-root UID, as Spin requires.
 
 ### Service environment
 
-| Variable                      | Required          | Meaning                                                                                                                               |
-| ----------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `LEDS_BASE_PATH`              | yes               | production cycle(s) on the mounted filesystem (e.g. CFS)                                                                              |
-| `BOKEH_ALLOW_WS_ORIGIN`       | yes               | public hostname (`host[:port]`) allowed to open the websocket, i.e. the Spin ingress name                                             |
-| `NUM_PROCS`                   | no (default 2)    | Panel worker processes; sessions in one process share an event loop                                                                   |
-| `LEDS_PREWARM`                | no (default off)  | scan cycles and build the newest channelmap before forking workers, so the first session of each is warm; delays the listening socket |
-| `LEDS_CACHE_TTL`              | no (default 3600) | seconds a metadata-derived entry (channelmaps, statuses, calibration pars) is reused before being re-read                             |
-| `LEDS_SCAN_TTL`               | no (default 300)  | seconds a directory scan is reused; bounds how long a newly-written run stays invisible                                               |
-| `LEDS_MAX_CACHED_RUN_SPECTRA` | no (default 4)    | whole runs of per-hit energies held **per worker**; the dominant memory line                                                          |
-| `LEDS_MAX_CACHED_CAL_PARS`    | no (default 4)    | parsed `par_hit` calibration files held **per worker**; MB-scale each                                                                 |
+| Variable                      | Required          | Meaning                                                                                                                                             |
+| ----------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LEDS_BASE_PATH`              | yes               | production cycle(s) on the mounted filesystem (e.g. CFS)                                                                                            |
+| `BOKEH_ALLOW_WS_ORIGIN`       | yes               | public hostname (`host[:port]`) allowed to open the websocket, i.e. the Spin ingress name                                                           |
+| `NUM_PROCS`                   | no (default 2)    | Panel worker processes; sessions in one process share its caches (and its HDF5 lock, see Threads)                                                   |
+| `NUM_THREADS`                 | no (default 4)    | thread pool per worker that callbacks run on, so one session's slow read does not freeze the others; `0` disables it (see Threads)                  |
+| `LEDS_PREWARM`                | no (default on)   | scan cycles and build the newest channelmap before forking workers, so the first session of each is warm; delays the listening socket; `0` disables |
+| `LEDS_CACHE_TTL`              | no (default 3600) | seconds a metadata-derived entry (channelmaps, statuses, calibration pars) is reused before being re-read                                           |
+| `LEDS_SCAN_TTL`               | no (default 300)  | seconds a directory scan is reused; bounds how long a newly-written run stays invisible                                                             |
+| `LEDS_MAX_CACHED_RUN_SPECTRA` | no (default 4)    | whole runs of per-hit energies held **per worker**; the dominant memory line                                                                        |
+| `LEDS_MAX_CACHED_CAL_PARS`    | no (default 4)    | parsed `par_hit` calibration files held **per worker**; MB-scale each                                                                               |
 
 Sessions in one worker share the read-only data they have in common —
 channelmaps, detector statuses, directory scans, per-run reductions — so a
@@ -65,6 +66,26 @@ Because that sharing includes the parsed metadata, an updated metadata checkout
 is picked up within `LEDS_CACHE_TTL` rather than immediately. Lower it if the
 deployment updates metadata often; restarting the service always picks it up at
 once.
+
+### Threads
+
+`NUM_THREADS` (`leds serve --num-threads`) runs callbacks on a thread pool
+instead of the worker's single event loop. Without it, one session's slow
+operation — a first visit to the Validation tab, a raw read stalling on CFS —
+freezes the UI of every other session in that worker until it finishes. With it
+those sessions keep responding, and work that is not HDF5 (parsing a channelmap,
+evaluating cuts, building Bokeh models) runs in parallel.
+
+What it does not buy: h5py serialises every HDF5 call behind one process-wide
+lock, so two sessions' raw reads still take turns within a worker. `NUM_PROCS`
+is the lever for that; the two combine.
+
+Per-session state — the viewer's caches and open HDF5 handles, the spectrum
+accumulator, the tab bookkeeping — is guarded by one lock per session, so a
+session's own callbacks never overlap even though they run on the pool. Open
+HDF5 handles are per session and never shared across sessions or forked workers.
+A playback tick that arrives while the previous frame is still rendering is
+dropped rather than queued.
 
 ### Login (Spin secrets)
 
