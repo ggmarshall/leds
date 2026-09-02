@@ -122,8 +122,8 @@ class SharedLRU:
 
 #: ``(metadata_path, tstamp)`` -> channelmap. The dominant per-session cost:
 #: building one parses the whole metadata checkout and shells out to git.
-#: Entries are ``AttrsDict``s marked read-only all the way down, so a session
-#: cannot corrupt another's view of one.
+#: Entries are ``AttrsDict`` objects marked read-only all the way down, so a
+#: session cannot corrupt another's view of one.
 CHANNELMAPS = SharedLRU(32, ttl=METADATA_TTL, name="channelmaps")
 
 #: ``(metadata_path,)`` -> ``LegendMetadata``. Sharing these also shares their
