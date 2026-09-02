@@ -518,7 +518,7 @@ class EventDisplay(param.Parameterized):
         would still freeze every session in the worker, so hand the work to
         Panel's pool; without one, run it inline as before.
         """
-        if pn.state._thread_pool is not None:
+        if pn.config.nthreads:
             pn.state.execute(partial(method, *args), schedule="thread")
         else:
             method(*args)

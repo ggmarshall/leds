@@ -182,10 +182,11 @@ def main(argv=None):
     serve.add_argument(
         "--num-threads",
         type=int,
-        default=int(os.environ.get("LEDS_NUM_THREADS") or 0),
+        default=0,
         help="size of the thread pool callbacks run on, so one session's slow "
-        "read does not freeze the others in its process; 0 keeps everything "
-        "on the event loop (default $LEDS_NUM_THREADS or 0)",
+        "read does not freeze the others in its process; 0 (the default) "
+        "keeps everything on the event loop. The container passes "
+        "$NUM_THREADS here, as it does $NUM_PROCS to --num-procs",
     )
     serve.add_argument(
         "--prewarm",

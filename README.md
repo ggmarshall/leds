@@ -69,12 +69,13 @@ once.
 
 ### Threads
 
-`NUM_THREADS` (`leds serve --num-threads`) runs callbacks on a thread pool
-instead of the worker's single event loop. Without it, one session's slow
-operation — a first visit to the Validation tab, a raw read stalling on CFS —
-freezes the UI of every other session in that worker until it finishes. With it
-those sessions keep responding, and work that is not HDF5 (parsing a channelmap,
-evaluating cuts, building Bokeh models) runs in parallel.
+`NUM_THREADS` (passed by the image to `leds serve --num-threads`, like
+`NUM_PROCS` to `--num-procs`) runs callbacks on a thread pool instead of the
+worker's single event loop. Without it, one session's slow operation — a first
+visit to the Validation tab, a raw read stalling on CFS — freezes the UI of
+every other session in that worker until it finishes. With it those sessions
+keep responding, and work that is not HDF5 (parsing a channelmap, evaluating
+cuts, building Bokeh models) runs in parallel.
 
 What it does not buy: h5py serialises every HDF5 call behind one process-wide
 lock, so two sessions' raw reads still take turns within a worker. `NUM_PROCS`

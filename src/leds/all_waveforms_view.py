@@ -253,7 +253,11 @@ class AllWaveformsFigure:
             param,
             subtract_baseline,
             kind,
-            tuple(rawid for rawid, _name, _group in dets),
+            # the detector *set*: "above threshold" lists detectors by energy,
+            # and a reshuffle between events must not throw the layout (and
+            # the user's zoom) away -- the order fixed at build time stands
+            # until a detector enters or leaves
+            tuple(sorted(rawid for rawid, _name, _group in dets)),
         )
         rebuilt = key != self.layout_key
         if rebuilt:

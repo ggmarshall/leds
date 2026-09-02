@@ -152,6 +152,12 @@ def test_above_threshold_rebuilds_only_when_the_fired_set_changes():
     ev.fired_detectors.append({"rawid": 3, "name": "V03", "energy": 30.0, "hit_idx": 0})
     assert fig.update(ev, **opts) is True, "a new detector fired: rebuild"
 
+    # the same two detectors swap energy order: still the same set, no rebuild
+    ev.index = 2
+    ev.fired_detectors[0]["energy"], ev.fired_detectors[1]["energy"] = 40.0, 300.0
+    ev.energy_dict = {"V01": 40.0, "V03": 300.0}
+    assert fig.update(ev, **opts) is False, "reordering is not a layout change"
+
 
 def test_an_unreadable_channel_shows_nothing_rather_than_a_stale_trace():
     ev = FakeViewer()
