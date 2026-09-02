@@ -17,7 +17,7 @@ validation views over a legend-dataflow production cycle.
 ## Running
 
 ```bash
-pip install leds   # or: uv pip install .
+pip install legend-leds   # or: uv pip install .
 
 leds app /path/to/production_cycle          # local single-user browser tab
 leds app --desktop /path/to/cycle           # native window (needs leds[desktop])

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 
 [project]
-name = "leds"
+name = "legend-leds"
 authors = [
   { name = "Luigi Pertoldi", email = "gipert@pm.me" },
   { name = "George Marshall", email = "george.marshall.20@ucl.ac.uk" },
@@ -51,7 +51,7 @@ leds = "leds.cli:main"
 
 [project.optional-dependencies]
 all = [
-  "leds[docs,test,desktop]"
+  "legend-leds[docs,test,desktop]"
 ]
 desktop = [
   # native-window launcher for the local GUI mode (`leds app --desktop`)

@@ -9,7 +9,7 @@ sys.path.insert(0, Path(__file__).parents[2].resolve().as_posix())
 
 project = "leds"
 copyright = "Copyright Holder"
-version = _version("leds")
+version = _version("legend-leds")
 
 extensions = [
     "sphinx.ext.githubpages",
