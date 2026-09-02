@@ -1,39 +1,47 @@
-"""Guards against redundant figure rebuilds in :class:`EventDisplay`.
+"""Guards against redundant work in :class:`EventDisplay`: figures rebuilt when
+nothing they draw from changed, and callbacks of one session overlapping.
 
-The expensive work behind each tab is one builder call -- ``plot_all_waveforms``
-reads ~100 waveforms, ``dataset_figure`` walks every run of the cycle -- so
-counting *those* (rather than the ``_update_*`` methods, which self-gate and
-return early) measures the work a single user interaction actually costs. These
-are the regressions that are otherwise invisible: the app stays correct, it
-just does the work three times.
+The expensive work behind each tab is one builder call -- refreshing the
+all-waveforms figure reads ~100 waveforms, *rebuilding* it also makes the
+browser redraw every renderer -- so counting *those* (rather than the
+``_update_*`` methods, which self-gate and return early) measures what a
+single user interaction actually costs. These are the regressions that are
+otherwise invisible: the app stays correct, it just does the work three times.
 
-Needs a real production cycle; set ``$LEDS_BASE_PATH`` (the mock cycle used by
-the ``run-app`` skill is enough) or these skip.
+Most tests need a real production cycle; set ``$LEDS_BASE_PATH`` (the mock
+cycle used by the ``run-app`` skill is enough) or they skip.
 """
 
 from __future__ import annotations
 
+import inspect
 import os
+import threading
+import time
 
 import pytest
 
 from leds import app as app_mod
 
-#: Expensive builders, as named in ``leds.app``'s namespace.
-BUILDERS = ("plot_all_waveforms", "plot_event_waveforms")
+#: Expensive work, as ``name: (holder, attribute)``. ``all_wf_build`` creates
+#: the all-waveforms Bokeh models (what the browser then has to tear down and
+#: redraw); ``all_wf_refresh`` only reads the waveforms into existing sources.
+BUILDERS = {
+    "plot_event_waveforms": (app_mod, "plot_event_waveforms"),
+    "all_wf_build": (app_mod.AllWaveformsFigure, "_build"),
+    "all_wf_refresh": (app_mod.AllWaveformsFigure, "_refresh"),
+}
 
 
 class Counter:
-    """Patches the expensive builders in ``leds.app`` and tallies real rebuilds."""
+    """Patches the expensive builders and tallies real calls."""
 
     def __init__(self, monkeypatch):
         self.counts = dict.fromkeys(BUILDERS, 0)
-        for name in BUILDERS:
-            monkeypatch.setattr(app_mod, name, self._wrap(name))
+        for name, (holder, attr) in BUILDERS.items():
+            monkeypatch.setattr(holder, attr, self._wrap(name, getattr(holder, attr)))
 
-    def _wrap(self, name):
-        inner = getattr(app_mod, name)
-
+    def _wrap(self, name, inner):
         def counted(*args, **kwargs):
             self.counts[name] += 1
             return inner(*args, **kwargs)
@@ -60,6 +68,9 @@ def counter(monkeypatch):
     return Counter(monkeypatch)
 
 
+# ---------------------------------------------------------------- rebuild counts
+
+
 def test_system_change_rebuilds_all_waveforms_once(display, counter):
     """Changing System must not fan out through the grouping/kind/category watchers."""
     display.tabs.active = app_mod.TAB_WAVEFORMS
@@ -67,7 +78,8 @@ def test_system_change_rebuilds_all_waveforms_once(display, counter):
 
     display.all_wf_system = "spms" if display.all_wf_system == "geds" else "geds"
 
-    assert counter.counts["plot_all_waveforms"] == 1
+    assert counter.counts["all_wf_build"] == 1
+    assert counter.counts["all_wf_refresh"] == 1
 
 
 def test_grouping_change_rebuilds_all_waveforms_once(display, counter):
@@ -80,7 +92,7 @@ def test_grouping_change_rebuilds_all_waveforms_once(display, counter):
         pytest.skip("only one grouping available for this system")
     display.all_wf_grouping = other
 
-    assert counter.counts["plot_all_waveforms"] == 1
+    assert counter.counts["all_wf_build"] == 1
 
 
 def test_returning_to_a_tab_does_not_rebuild(display, counter):
@@ -91,24 +103,116 @@ def test_returning_to_a_tab_does_not_rebuild(display, counter):
 
     display.tabs.active = app_mod.TAB_WAVEFORMS
 
-    assert counter.counts["plot_all_waveforms"] == 0
+    assert counter.counts["all_wf_build"] == 0
+    assert counter.counts["all_wf_refresh"] == 0
 
 
-def test_new_event_rebuilds_the_active_tab_once(display, counter):
-    """A new event must still refresh the tab the user is looking at -- once."""
+def test_new_event_refreshes_the_active_tab_without_rebuilding(display, counter):
+    """A new event refreshes the data once; the figure (and its zoom) survives."""
     display.tabs.active = app_mod.TAB_WAVEFORMS
+    root = display._all_wf_figure.root
     counter.reset()
 
     display.index += 1
 
-    assert counter.counts["plot_all_waveforms"] == 1
+    assert counter.counts["all_wf_refresh"] == 1
+    assert counter.counts["all_wf_build"] == 0
+    assert display._all_wf_figure.root is root
+    assert display.all_wf_pane.object is root
 
 
-def test_inactive_tabs_are_not_rebuilt_on_a_new_event(display, counter):
+def test_inactive_tabs_are_not_refreshed_on_a_new_event(display, counter):
     """The gate is what keeps playback from reading ~100 waveforms per step."""
     display.tabs.active = app_mod.TAB_EVENT
     counter.reset()
 
     display.index += 1
 
-    assert counter.counts["plot_all_waveforms"] == 0
+    assert counter.counts["all_wf_refresh"] == 0
+    assert counter.counts["all_wf_build"] == 0
+
+
+# ---------------------------------------------------------------- serialisation
+
+#: Entry points that are not param watchers: Panel button/tab callbacks, the
+#: onload hook, and the bodies the Bokeh ``on_change`` handlers dispatch to.
+ENTRY_POINTS = (
+    "_on_tab",
+    "_first_render",
+    "_on_find",
+    "_on_prev",
+    "_on_next",
+    "_on_clear",
+    "_select_detector",
+    "_select_bin",
+    "_jump_to_run",
+)
+
+
+def test_every_callback_entry_point_is_serialized():
+    """A watcher added without the lock is a race under nthreads; catch it here."""
+    members = vars(app_mod.EventDisplay)
+    watchers = [
+        name
+        for name, fn in members.items()
+        if inspect.isfunction(fn) and hasattr(fn, "_dinfo")  # param.depends marker
+    ]
+    assert len(watchers) >= 10, "param.depends no longer marks methods this way?"
+
+    unguarded = [
+        name
+        for name in (*watchers, *ENTRY_POINTS)
+        if not getattr(members[name], "_serialized", False)
+    ]
+    assert unguarded == []
+
+
+def test_callbacks_of_one_session_never_overlap(display, monkeypatch):
+    display.tabs.active = app_mod.TAB_WAVEFORMS
+    monkeypatch.setattr(display, "_tab_is_current", lambda *_a: False)  # always redraw
+    in_flight, peak, guard = [0], [0], threading.Lock()
+    original = app_mod.AllWaveformsFigure._refresh
+
+    def slow_refresh(self, *args, **kwargs):
+        with guard:
+            in_flight[0] += 1
+            peak[0] = max(peak[0], in_flight[0])
+        time.sleep(0.05)
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            with guard:
+                in_flight[0] -= 1
+
+    monkeypatch.setattr(app_mod.AllWaveformsFigure, "_refresh", slow_refresh)
+
+    threads = [threading.Thread(target=display._on_index) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert peak[0] == 1
+
+
+def test_playback_tick_is_dropped_while_the_session_is_busy(display):
+    display._run_length = 10
+    start = display.index
+    acquired, release = threading.Event(), threading.Event()
+
+    def busy():
+        with display._lock:
+            acquired.set()
+            release.wait(timeout=5)
+
+    other = threading.Thread(target=busy)
+    other.start()
+    assert acquired.wait(timeout=5)
+
+    display._advance()  # another callback of this session is mid-flight
+    assert display.index == start, "dropped, not queued"
+
+    release.set()
+    other.join(timeout=5)
+    display._advance()
+    assert display.index == start + 1

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.resources
+import threading
 from contextlib import contextmanager
+from functools import partial, wraps
 
 import numpy as np
 import pandas as pd
@@ -19,9 +21,9 @@ from leds import (
 )
 from leds.all_waveforms_view import (
     SYSTEMS,
+    AllWaveformsFigure,
     category_options,
     groupings_for,
-    plot_all_waveforms,
     raw_kinds_for,
     y_axis_label,
 )
@@ -118,6 +120,29 @@ def _update_energy(source, data):
         source.data = data
 
 
+def _serialized(method):
+    """Run an :class:`EventDisplay` entry point under its session lock.
+
+    With ``pn.config.nthreads`` set, Panel runs widget events, Bokeh events,
+    periodic callbacks and ``onload`` on a thread pool, so two callbacks of the
+    *same* session can otherwise overlap and race on the per-session state
+    (the viewer's caches and open files, the accumulating spectrum, the tab
+    bookkeeping). One re-entrant lock per session serialises them; nested
+    watchers -- a handler setting a param whose own watcher fires -- re-enter
+    it on the same thread. Direct Bokeh writes inside go through
+    :meth:`EventDisplay._on_loop`. Without ``nthreads`` the lock is never
+    contended and every callback behaves exactly as before.
+    """
+
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    wrapper._serialized = True
+    return wrapper
+
+
 def build_header_links():
     """Row of LEGEND resource icon-links, as in the monitoring dashboard header."""
     return pn.Row(
@@ -198,6 +223,14 @@ class EventDisplay(param.Parameterized):
     validation_detector = param.Selector(default=None, objects=[])
 
     def __init__(self, base_path=None, **params):
+        # serialises this session's callbacks; see _serialized. Created first:
+        # the watchers it wraps are registered by super().__init__, and
+        # _relayout() is called below
+        self._lock = threading.RLock()
+        # the thread that owns this session's document: Bokeh builds the
+        # session on its event loop, so anything later running on another
+        # thread is one of Panel's pool threads (see _on_loop)
+        self._loop_thread = threading.get_ident()
         self.roots = resolve_base_paths(base_path)
         self._cycle_paths = discover_cycles(self.roots)
         if not self._cycle_paths:
@@ -395,16 +428,7 @@ class EventDisplay(param.Parameterized):
             dynamic=True,
         )
 
-        def _on_tab(_e):
-            # each updater self-gates on the active tab and on whether anything
-            # it draws has actually changed, so this is one rebuild at most
-            self._update_all_waveforms()
-            self._update_run_spectrum()
-            self._update_event_details()
-            self._update_dataset()
-            self._update_validation()
-
-        self.tabs.param.watch(_on_tab, "active")
+        self.tabs.param.watch(self._on_tab, "active")
 
         self.message = pn.pane.Alert("", alert_type="warning", visible=False)
 
@@ -425,7 +449,7 @@ class EventDisplay(param.Parameterized):
         self.event_selection = None
         self.selection_info = pn.pane.Markdown("")
         self.clear_button = pn.widgets.Button(name="Clear selection", width=140)
-        self.clear_button.on_click(lambda _e: self._clear_selection())
+        self.clear_button.on_click(self._on_clear)
         self.run_spectrum_source.selected.on_change("indices", self._on_bin_select)
 
         self._playback_cb = None
@@ -442,6 +466,9 @@ class EventDisplay(param.Parameterized):
         self._accum_index = None
         self._accum_counts = None
 
+        # the all-waveforms figure, rebuilt only when its layout changes
+        self._all_wf_figure = AllWaveformsFigure()
+
         self._apply_period(defer=True)
         self._relayout()
         # hand the page over first, then read event 0
@@ -450,6 +477,65 @@ class EventDisplay(param.Parameterized):
         # _sync_properties, which would abort the rest of __init__)
         self.main_row.loading = True
         pn.state.onload(self._first_render)
+
+    def _on_loop(self, write):
+        """Run ``write`` -- direct Bokeh model writes -- under the document lock.
+
+        Bokeh models may only be changed while their document is locked. On
+        the event loop a callback already holds it, so ``write`` runs at once;
+        on one of Panel's pool threads it is queued as a next-tick callback,
+        which Bokeh runs on the loop with the lock. Either way the writes run
+        inside Panel's ``unlocked()``, so they are combined into one patch and
+        dispatched through the same writer Panel uses for its own model
+        updates -- mixing Bokeh's flush with Panel's deferred writer let a
+        data patch reach the browser before the figure it belonged to. This
+        is the pattern Panel itself uses for model updates from a thread.
+        (Panel's threaded ``hold()`` is not used: with two callbacks of one
+        session on two pool threads, the loop can unhold the document while
+        the second is still writing.) The heavy work -- reads, histogramming
+        -- stays on the thread; only the final assignments move, so callers
+        compute first and pass a closure over the results.
+        """
+        doc = pn.state.curdoc
+        if doc is None or doc.session_context is None:
+            write()
+            return
+
+        def dispatch():
+            with pn.io.unlocked():
+                write()
+
+        if threading.get_ident() == self._loop_thread:
+            dispatch()
+        else:
+            doc.add_next_tick_callback(dispatch)
+
+    def _dispatch(self, method, *args):
+        """Run a Bokeh-invoked handler where Panel runs everything else.
+
+        Bokeh calls ``on_change`` handlers on the event loop, holding the
+        document lock. Under ``nthreads`` that is the one place a slow read
+        would still freeze every session in the worker, so hand the work to
+        Panel's pool; without one, run it inline as before.
+        """
+        if pn.config.nthreads:
+            pn.state.execute(partial(method, *args), schedule="thread")
+        else:
+            method(*args)
+
+    @_serialized
+    def _on_tab(self, _event):
+        # each updater self-gates on the active tab and on whether anything
+        # it draws has actually changed, so this is one rebuild at most
+        self._update_all_waveforms()
+        self._update_run_spectrum()
+        self._update_event_details()
+        self._update_dataset()
+        self._update_validation()
+
+    @_serialized
+    def _on_clear(self, _event):
+        self._clear_selection()
 
     def _tab_is_current(self, tab, key):
         """True when ``tab`` is already drawn for exactly this state.
@@ -507,6 +593,7 @@ class EventDisplay(param.Parameterized):
         if not defer:
             self._after_data_change()
 
+    @_serialized
     def _first_render(self):
         """The initial event read, run once the page has been delivered.
 
@@ -535,6 +622,7 @@ class EventDisplay(param.Parameterized):
             )
 
     @param.depends("production_cycle", watch=True)
+    @_serialized
     def _on_cycle(self):
         self._load_cycle(self.production_cycle)
         self.run_spectrum = RunSpectrum(self.viewer)
@@ -544,6 +632,7 @@ class EventDisplay(param.Parameterized):
         self._validation_figs.clear()
         self._cal_cache.clear()
         self._tab_state.clear()
+        self._all_wf_figure = AllWaveformsFigure()
         self._update_dataset()
         periods = sorted(self.runs)
         self.param.period.objects = periods
@@ -551,12 +640,14 @@ class EventDisplay(param.Parameterized):
         self._apply_period()
 
     @param.depends("period", watch=True)
+    @_serialized
     def _on_period(self):
         if self._internal_change:
             return
         self._apply_period()
 
     @param.depends("run", watch=True)
+    @_serialized
     def _on_run(self):
         if self._internal_change:
             return
@@ -565,12 +656,14 @@ class EventDisplay(param.Parameterized):
         self._after_data_change()
 
     @param.depends("index", watch=True)
+    @_serialized
     def _on_index(self):
         if self._internal_change:
             return
         self._render()
 
     @param.depends("waveform_param", "subtract_baseline", watch=True)
+    @_serialized
     def _on_display_options(self):
         # display-only change: redraw the waveform panes, no event re-read
         self._update_waveforms()
@@ -587,26 +680,31 @@ class EventDisplay(param.Parameterized):
             self.viewer.get_event(self.period, self.run, self.index)
             geds_data = build_source_data(self.viewer)
             sipm_data = sipm_view.build_source_data(self.viewer, geds_data)
-            # Only the energies change from event to event; the polygon
-            # geometry and per-detector metadata are fixed by the channelmap.
-            # Re-sending all of it every event costs ~80x the bytes, and the
-            # ticker below would rebuild a Bokeh model for labels that did not
-            # move. One hold() so both sources land in a single document patch.
-            with pn.io.hold():
-                if self._source_tstamp == self.viewer.tstamp:
-                    _update_energy(self.geds_source, geds_data)
-                    _update_energy(self.sipm_source, sipm_data)
-                else:
+            title = (
+                f"{self.viewer.period} {self.viewer.run} {self.index} "
+                f"- {self.viewer.event_timestamp}"
+            )
+            static_changed = self._source_tstamp != self.viewer.tstamp
+            self._source_tstamp = self.viewer.tstamp
+
+            def draw():
+                # Only the energies change from event to event; the polygon
+                # geometry and per-detector metadata are fixed by the
+                # channelmap. Re-sending all of it every event costs ~80x the
+                # bytes, and the ticker would rebuild a Bokeh model for labels
+                # that did not move. _on_loop lands it all in one patch.
+                if static_changed:
                     self.geds_source.data = geds_data
                     self.sipm_source.data = sipm_data
                     labels = sipm_view.row_label_map(geds_data)
                     self.figure.yaxis.ticker = FixedTicker(ticks=list(labels))
                     self.figure.yaxis.major_label_overrides = labels
-                    self._source_tstamp = self.viewer.tstamp
-                self.figure.title.text = (
-                    f"{self.viewer.period} {self.viewer.run} {self.index} "
-                    f"- {self.viewer.event_timestamp}"
-                )
+                else:
+                    _update_energy(self.geds_source, geds_data)
+                    _update_energy(self.sipm_source, sipm_data)
+                self.figure.title.text = title
+
+            self._on_loop(draw)
             # the category refresh can re-point all_wf_category and fire its own
             # watcher; suspend it so the explicit rebuild below happens once
             with self._all_wf_batch():
@@ -645,7 +743,8 @@ class EventDisplay(param.Parameterized):
             self.message.object = f"**spectrum:** {type(exc).__name__}: {exc}"
             self.message.visible = True
             return
-        self.spectrum_source.data = spectrum_view.source_data(counts, edges)
+        data = spectrum_view.source_data(counts, edges)
+        self._on_loop(lambda: self.spectrum_source.update(data=data))
 
     def _accumulated_histogram(self):
         """Counts of every geds hit up to the current event.
@@ -747,7 +846,8 @@ class EventDisplay(param.Parameterized):
             self.message.object = f"**spectrum:** {type(exc).__name__}: {exc}"
             self.message.visible = True
             return
-        self.run_spectrum_source.data = spectrum_view.source_data(counts, edges)
+        data = spectrum_view.source_data(counts, edges)
+        self._on_loop(lambda: self.run_spectrum_source.update(data=data))
         self._tab_drawn(TAB_SPECTRUM, key)
 
     @param.depends(
@@ -765,6 +865,7 @@ class EventDisplay(param.Parameterized):
         "cut_multiplicity",
         watch=True,
     )
+    @_serialized
     def _on_spectrum_controls(self):
         self._clear_selection()  # bins (and their event sets) change
         self._update_run_spectrum()
@@ -774,9 +875,13 @@ class EventDisplay(param.Parameterized):
     def _clear_selection(self):
         self.event_selection = None
         self.selection_info.object = ""
-        self.run_spectrum_source.selected.indices = []
+        self._on_loop(lambda: self.run_spectrum_source.selected.update(indices=[]))
 
     def _on_bin_select(self, _attr, _old, new):
+        self._dispatch(self._select_bin, new)
+
+    @_serialized
+    def _select_bin(self, new):
         if not new or self.viewer is None or not self.period or not self.run:
             self.event_selection = None
             self.selection_info.object = ""
@@ -797,6 +902,7 @@ class EventDisplay(param.Parameterized):
         self.index = int(sel[0])
 
     @param.depends("all_wf_system", watch=True)
+    @_serialized
     def _on_all_wf_system(self):
         # switching system re-points grouping, kind and category; each has its
         # own watcher, so suspend them and rebuild once at the end -- otherwise
@@ -856,7 +962,10 @@ class EventDisplay(param.Parameterized):
         )
         if self._tab_is_current(TAB_WAVEFORMS, key):
             return
-        self.all_wf_pane.object = plot_all_waveforms(
+        # a new event only refreshes the existing figure's data; the figure
+        # (and the pane showing it) is replaced only when the layout changed,
+        # so the browser keeps its renderers and its zoom
+        rebuilt = self._all_wf_figure.update(
             self.viewer,
             system=self.all_wf_system,
             grouping=self.all_wf_grouping,
@@ -866,16 +975,20 @@ class EventDisplay(param.Parameterized):
             processor=self.processor,
             subtract_baseline=self.subtract_baseline,
             kind=self.all_wf_kind,
+            apply=self._on_loop,
         )
-        # exploded subplots drop their y label in favour of one shared label on
-        # the left; the compressed single figure keeps its own and fills the row
-        if self.all_wf_exploded:
-            self.all_wf_ylabel.object = _vertical_label_html(
-                y_axis_label(self.waveform_param, self.subtract_baseline)
-            )
-            self.all_wf_area[:] = [self.all_wf_ylabel, self.all_wf_pane]
-        else:
-            self.all_wf_area[:] = [self.all_wf_pane]
+        if rebuilt:
+            self.all_wf_pane.object = self._all_wf_figure.root
+            # exploded subplots drop their y label in favour of one shared
+            # label on the left; the compressed single figure keeps its own
+            # and fills the row
+            if self.all_wf_exploded:
+                self.all_wf_ylabel.object = _vertical_label_html(
+                    y_axis_label(self.waveform_param, self.subtract_baseline)
+                )
+                self.all_wf_area[:] = [self.all_wf_ylabel, self.all_wf_pane]
+            else:
+                self.all_wf_area[:] = [self.all_wf_pane]
         self._tab_drawn(TAB_WAVEFORMS, key)
 
     def _update_dataset(self):
@@ -904,10 +1017,15 @@ class EventDisplay(param.Parameterized):
                 "indices", lambda _a, _o, new, s=source: self._on_dataset_tap(s, new)
             )
             self._dataset_figs[key] = fig
-        self.dataset_pane.object = fig
+        if fig is not self.dataset_pane.object:  # see _update_validation
+            self.dataset_pane.object = fig
         self._tab_drawn(TAB_DATASET, (self.production_cycle, key))
 
     def _on_dataset_tap(self, source, new):
+        self._dispatch(self._jump_to_run, source, new)
+
+    @_serialized
+    def _jump_to_run(self, source, new):
         if not new:
             return
         period, run = source.data["x"][new[0]]
@@ -922,6 +1040,7 @@ class EventDisplay(param.Parameterized):
         self.message.visible = True
 
     @param.depends("dataset_plot", "dataset_datatype", watch=True)
+    @_serialized
     def _on_dataset_controls(self):
         self._update_dataset()
 
@@ -948,7 +1067,13 @@ class EventDisplay(param.Parameterized):
             self.message.visible = True
             return
         if fig is not None:
-            self.validation_pane.object = fig
+            # never re-assign the figure already on screen: param treats any
+            # object assignment as a change, Panel re-renders it, and its
+            # ``_sync_properties`` then copies the rendered figure's themed
+            # ``stylesheets`` (ImportedStyleSheet models) into the pane's
+            # str-only param and raises (Panel 1.9)
+            if fig is not self.validation_pane.object:
+                self.validation_pane.object = fig
             # re-read the state: building a calibration plot can re-point
             # validation_detector at the run's first detector
             self._tab_drawn(TAB_VALIDATION, self._validation_state())
@@ -1088,23 +1213,27 @@ class EventDisplay(param.Parameterized):
         "validation_detector",
         watch=True,
     )
+    @_serialized
     def _on_validation_controls(self):
         if self._internal_change:
             return
         self._update_validation()
 
     @param.depends("all_wf_grouping", watch=True)
+    @_serialized
     def _on_all_wf_grouping(self):
         self._refresh_all_wf_categories()
         self._update_all_waveforms()
 
     @param.depends("all_wf_category", "all_wf_exploded", "all_wf_kind", watch=True)
+    @_serialized
     def _on_all_wf_controls(self):
         # label the toggle by the action it performs
         self.exploded_toggle.name = "Compressed" if self.all_wf_exploded else "Exploded"
         self._update_all_waveforms()
 
     @param.depends("show_waveforms", "show_spectrum", watch=True)
+    @_serialized
     def _relayout(self):
         right = []
         if self.show_spectrum:
@@ -1124,9 +1253,14 @@ class EventDisplay(param.Parameterized):
         self._update_spectrum()
 
     def _on_tap(self, _attr, _old, new):
+        self._dispatch(self._select_detector, new)
+
+    @_serialized
+    def _select_detector(self, new):
         self.selected_detector = self.geds_source.data["name"][new[0]] if new else ""
         self._update_waveforms()
 
+    @_serialized
     def _on_find(self, _event):
         if self.viewer is None:
             self.message.object = "**timestamp search:** no production cycle loaded"
@@ -1143,6 +1277,7 @@ class EventDisplay(param.Parameterized):
         self._set_quietly(period=period, run=run, index=index)
         self._after_data_change()
 
+    @_serialized
     def _on_prev(self, _event):
         sel = self.event_selection
         if sel is not None:
@@ -1152,6 +1287,7 @@ class EventDisplay(param.Parameterized):
         elif self.index > 0:
             self.index -= 1
 
+    @_serialized
     def _on_next(self, _event):
         sel = self.event_selection
         if sel is not None:
@@ -1162,6 +1298,7 @@ class EventDisplay(param.Parameterized):
             self.index += 1
 
     @param.depends("playing", "playback_period", watch=True)
+    @_serialized
     def _playback(self):
         if self._playback_cb is not None:
             self._playback_cb.stop()
@@ -1179,10 +1316,20 @@ class EventDisplay(param.Parameterized):
             )
 
     def _advance(self):
-        if self._run_length is None or self.index + 1 >= self._run_length:
-            self.playing = False  # end of run (or no run loaded) -> stop
+        # the playback tick. Not _serialized: if the previous frame is still
+        # rendering (a slow read, or the all-waveforms tab open), drop this
+        # tick rather than queue frames behind it -- playback then runs as
+        # fast as the data allows instead of falling ever further behind the
+        # timer
+        if not self._lock.acquire(blocking=False):
             return
-        self.index += 1
+        try:
+            if self._run_length is None or self.index + 1 >= self._run_length:
+                self.playing = False  # end of run (or no run loaded) -> stop
+                return
+            self.index += 1
+        finally:
+            self._lock.release()
 
     # -- layout ---------------------------------------------------------------
 

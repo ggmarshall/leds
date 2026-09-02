@@ -688,9 +688,10 @@ class EventViewer:
         all-waveforms view makes one call per channel -- ~100 opens per
         render, each a metadata round-trip on a network filesystem.
 
-        Per session and never shared: HDF5 handles are not fork-safe, and
-        concurrent readers on one handle are only safe while the event loop
-        stays single-threaded (see the note on ``nthreads`` in the README).
+        Per session and never shared: HDF5 handles are not fork-safe, and a
+        handle is only ever used from its own session's callbacks, which
+        :class:`leds.app.EventDisplay` serialises under one lock even when
+        Panel runs them on a thread pool (see "Threads" in the README).
         """
         path = str(path)
         handle = self._open_files.pop(path, None)  # re-inserted below (LRU order)
