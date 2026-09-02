@@ -93,6 +93,9 @@ filterwarnings = [
   # ldap3 2.9.1 still touches pyasn1's renamed tagMap/typeMap aliases
   "ignore:tagMap is deprecated:DeprecationWarning",
   "ignore:typeMap is deprecated:DeprecationWarning",
+  # the app labels its widgets with Panel's `name=`; `label=` only arrives in
+  # Panel 2.0, so this fires once per widget until we can require that version
+  "ignore:Widget.name is deprecated:PendingDeprecationWarning",
 ]
 log_cli_level = "INFO"
 testpaths = [
