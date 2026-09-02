@@ -20,6 +20,7 @@ read at the event index (physics-mode tables are event-aligned).
 
 from __future__ import annotations
 
+import numpy as np
 from bokeh.layouts import gridplot
 from bokeh.models import Legend
 from bokeh.palettes import Category20
@@ -152,9 +153,25 @@ def _compressed(
                 )
             except _READ_ERRORS:
                 continue
-            line = fig.line(x, y, color=color_of[group_label], line_width=1, alpha=0.7)
-            grouped.setdefault(group_label, []).append(line)
-        items = [(label, grouped[label]) for label in labels if label in grouped]
+            xs, ys = grouped.setdefault(group_label, ([], []))
+            # float32 halves the bytes on the wire and is far finer than the
+            # pixel grid these are drawn on
+            xs.append(np.asarray(x, dtype=np.float32))
+            ys.append(np.asarray(y, dtype=np.float32))
+        # one multi_line per group rather than one line per channel: with ~100
+        # channels that is a dozen Bokeh renderers and sources instead of a
+        # hundred, which is what makes this tab sluggish in the browser. The
+        # legend already grouped the per-channel lines, so hiding behaves the
+        # same.
+        items = []
+        for label in labels:
+            if label not in grouped:
+                continue
+            xs, ys = grouped[label]
+            renderer = fig.multi_line(
+                xs=xs, ys=ys, color=color_of[label], line_width=1, alpha=0.7
+            )
+            items.append((label, [renderer]))
     else:
         items = []
         for i, (rawid, name, _group) in enumerate(dets):
