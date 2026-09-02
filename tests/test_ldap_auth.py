@@ -252,6 +252,7 @@ def serve_args(**overrides):
         "basic_auth": None,
         "cookie_secret": "s3cret",
         "base_path": None,
+        "prewarm": False,
     }
     return argparse.Namespace(**{**defaults, **overrides})
 

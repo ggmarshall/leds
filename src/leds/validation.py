@@ -25,6 +25,8 @@ from dbetto import Props
 from dbetto.catalog import Catalog
 from lh5.io.exceptions import LH5DecodeError
 
+from leds._cache import CAL_PARS, VALIDATION_SUMMARIES
+
 #: Storage resolution of the per-run summaries. The UI bin widths below are
 #: all multiples of this (and divide a day, so the day-aligned base axis
 #: rebins exactly to any of them).
@@ -54,8 +56,9 @@ PEAKS_SUMMARY = (2614.511, 583.191, 2103.511)
 #: energy estimator).
 ENERGY_PARAM = "cuspEmax_ctc_cal"
 
-#: Cached per-run summaries (binned counts only, KB-scale entries).
-MAX_CACHED_RUNS = 64
+#: Cached per-channelmap string maps. A period usually spans a handful of
+#: channelmap timestamps, and deriving one costs a channelmap build.
+MAX_CACHED_STRING_MAPS = 8
 
 _DAY = 86400
 
@@ -98,8 +101,6 @@ class ValidationData:
 
     def __init__(self, viewer):
         self.viewer = viewer
-        self._cache: dict = {}
-        self._pars_cache: dict = {}
         self._strings_cache: dict = {}
 
     # -- per-run reduction --------------------------------------------------
@@ -221,7 +222,7 @@ class ValidationData:
         if not tstamps:
             msg = f"no data files for {period} {run}"
             raise ValueError(msg)
-        cached = self._strings_cache.get(tstamps[0])
+        cached = self._strings_cache.pop(tstamps[0], None)  # re-inserted below
         if cached is None:
             chmap = self.viewer._channelmap(tstamps[0])
             geds = chmap.map("system", unique=False).geds.map("name")
@@ -235,7 +236,9 @@ class ValidationData:
                     masses.get(string, 0.0) + float(det.production.mass_in_g) / 1000
                 )
             cached = ({s: frozenset(v) for s, v in rawids.items()}, masses)
-            self._strings_cache = {tstamps[0]: cached}  # one channelmap is plenty
+        self._strings_cache[tstamps[0]] = cached
+        while len(self._strings_cache) > MAX_CACHED_STRING_MAPS:
+            self._strings_cache.pop(next(iter(self._strings_cache)))
         return cached
 
     def _mass_kg(self, period, run, string=None):
@@ -267,49 +270,50 @@ class ValidationData:
         return ak.unflatten(flat, ak.num(d["rawid"]))
 
     def _summary(self, period, run, string=None):
-        """Binned counts of one run at base resolution (LRU-cached, tiny)."""
-        key = (period, run, string)
-        summary = self._cache.pop(key, None)  # re-insert below (LRU order)
-        if summary is None:
+        """Binned counts of one run at base resolution.
+
+        Shared across sessions: the entries are KB-scale but each is the
+        reduction of a whole run's evt columns, so building one is the
+        expensive part of a first visit to the Validation tab.
+        """
+        files = tuple(str(f) for f in self.viewer._run_files(period, run))
+
+        def build():
             d = self._columns(period, run)
             t = d["timestamp"]
             if t.size == 0:
-                summary = None
-            else:
-                hit_sel = (
-                    None
-                    if string is None
-                    else self._hit_selection(d, period, run, string)
-                )
-                # day-aligned absolute axis: every BIN_WIDTHS factor divides it
-                # exactly, and bins of different runs line up with each other
-                t0 = math.floor(t.min() / _DAY) * _DAY
-                t1 = math.ceil(t.max() / _DAY) * _DAY
-                t1 = max(t1, t0 + _DAY)
-                axis = bh.axis.Regular(int((t1 - t0) / BASE_BIN_SECONDS), t0, t1)
-                series = {}
-                for skey, mask in self._series_masks(d, hit_sel).items():
-                    if mask is None:
-                        series[skey] = None
-                        continue
-                    h = bh.Histogram(axis)
-                    h.fill(t[mask])
-                    series[skey] = h
-                # seconds of data coverage per bin (clipped overlap with the
-                # run's [first, last] timestamp); gaps between the run's DAQ
-                # cycles are not subtracted -- rates average over them
-                edges = axis.edges
-                exposure = bh.Histogram(axis, storage=bh.storage.Double())
-                exposure.view()[:] = np.clip(
-                    np.minimum(edges[1:], t.max()) - np.maximum(edges[:-1], t.min()),
-                    0.0,
-                    None,
-                )
-                summary = {"series": series, "exposure": exposure}
-        self._cache[key] = summary
-        while len(self._cache) > MAX_CACHED_RUNS:
-            self._cache.pop(next(iter(self._cache)))
-        return summary
+                return None
+            hit_sel = (
+                None if string is None else self._hit_selection(d, period, run, string)
+            )
+            # day-aligned absolute axis: every BIN_WIDTHS factor divides it
+            # exactly, and bins of different runs line up with each other
+            t0 = math.floor(t.min() / _DAY) * _DAY
+            t1 = math.ceil(t.max() / _DAY) * _DAY
+            t1 = max(t1, t0 + _DAY)
+            axis = bh.axis.Regular(int((t1 - t0) / BASE_BIN_SECONDS), t0, t1)
+            series = {}
+            for skey, mask in self._series_masks(d, hit_sel).items():
+                if mask is None:
+                    series[skey] = None
+                    continue
+                h = bh.Histogram(axis)
+                h.fill(t[mask])
+                series[skey] = h
+            # seconds of data coverage per bin (clipped overlap with the
+            # run's [first, last] timestamp); gaps between the run's DAQ
+            # cycles are not subtracted -- rates average over them
+            edges = axis.edges
+            exposure = bh.Histogram(axis, storage=bh.storage.Double())
+            exposure.view()[:] = np.clip(
+                np.minimum(edges[1:], t.max()) - np.maximum(edges[:-1], t.min()),
+                0.0,
+                None,
+            )
+            return {"series": series, "exposure": exposure}
+
+        key = (self.viewer.cycle_key, period, run, files, string)
+        return VALIDATION_SUMMARIES.get(key, build)
 
     # -- period assembly ------------------------------------------------------
 
@@ -401,13 +405,9 @@ class ValidationData:
         if par_file is None or not par_file.is_file():
             return None, f"no par_hit calibration file found for {period} {run}"
 
-        cache_key = str(par_file)
-        pars = self._pars_cache.pop(cache_key, None)
-        if pars is None:
-            pars = Props.read_from(str(par_file))
-        self._pars_cache[cache_key] = pars
-        while len(self._pars_cache) > 2:  # parsed files can be MB-scale
-            self._pars_cache.pop(next(iter(self._pars_cache)))
+        # shared across sessions: these files are MB-scale and take ~0.7 s to
+        # parse, and every session looking at this run wants the same one
+        pars = CAL_PARS.get((str(par_file),), lambda: Props.read_from(str(par_file)))
 
         # l200-p15-r005-cal-<ts>-par_hit.yaml -> "cal pars: p15 r005"
         parts = par_file.name.split("-")

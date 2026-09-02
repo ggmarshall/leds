@@ -20,6 +20,37 @@ def _bound_factory(base_path):
     return factory
 
 
+def _prewarm(base_path):
+    """Populate the shared caches before ``pn.serve`` forks its workers.
+
+    Bokeh forks for ``--num-procs`` inside ``pn.serve``, so anything cached
+    here is inherited copy-on-write by every worker and the first session each
+    one serves is already warm. Best-effort: a bad path must still leave a
+    server running that can report the problem in-app.
+
+    Deliberately metadata and directory scans only -- **no HDF5 file is opened
+    here**, because HDF5 is not fork-safe and an inherited handle would
+    corrupt reads in the children.
+    """
+    from leds.config import discover_cycles, resolve_base_paths  # noqa: PLC0415
+    from leds.event_viewer import EventViewer  # noqa: PLC0415
+
+    try:
+        for path in discover_cycles(resolve_base_paths(base_path)).values():
+            viewer = EventViewer(path)
+            runs = viewer.available_runs()
+            # the newest run's channelmap is what a new session renders first
+            for period in sorted(runs)[-1:]:
+                for run in sorted(runs[period])[-1:]:
+                    for tstamp in runs[period][run][:1]:
+                        viewer._channelmap(tstamp)
+                        viewer.statuses(tstamp)
+    except Exception as exc:
+        print(  # noqa: T201 (operator-facing CLI warning)
+            f"leds: pre-warm skipped ({type(exc).__name__}: {exc})", file=sys.stderr
+        )
+
+
 def _free_port():
     sock = socket.socket()
     sock.bind(("", 0))
@@ -93,7 +124,10 @@ def _serve(args):
         serve_kwargs["login_template"] = login_template
         serve_kwargs["logout_template"] = logout_template
 
-    pn.serve(_bound_factory(args.base_path), **serve_kwargs)
+    factory = _bound_factory(args.base_path)  # imports leds.app before forking
+    if args.prewarm:
+        _prewarm(args.base_path)
+    pn.serve(factory, **serve_kwargs)
 
 
 def _app(args):
@@ -137,6 +171,15 @@ def main(argv=None):
     serve.add_argument("--address", default="0.0.0.0")
     serve.add_argument("--port", type=int, default=5006)
     serve.add_argument("--num-procs", type=int, default=1)
+    serve.add_argument(
+        "--prewarm",
+        action="store_true",
+        default=os.environ.get("LEDS_PREWARM", "").lower() in ("1", "true", "yes"),
+        help="scan the cycles and build the newest channelmap before serving, "
+        "so the first session of every worker is warm (default $LEDS_PREWARM). "
+        "Delays the listening socket by that much -- check it against any "
+        "readiness probe",
+    )
     serve.add_argument(
         "--allow-websocket-origin",
         action="append",

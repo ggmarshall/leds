@@ -192,13 +192,11 @@ def _fmt_livetime(seconds):
 def usability_cells(viewer, datatype="phy"):
     """Long-form per-cell columns for the usability matrix + grid scaffolding."""
     cols, names, strings = _grid(viewer, datatype)
-    statuses_db = viewer.status_db.statuses
-
     cells = {c: [] for c in ("x", "y", "color", "usability", "reason", "livetime")}
     for period, run, start_key, livetime in cols:
         if start_key is None:
             continue  # run absent from runinfo for this datatype -> blank column
-        statuses = statuses_db.on(start_key, category=datatype)
+        statuses = viewer.statuses(start_key, category=datatype)
         for name in names:
             entry = statuses.get(name)
             if entry is None:
@@ -261,13 +259,11 @@ def _bb_like_status(psd):
 def psd_cells(viewer, datatype="phy"):
     """Long-form per-cell columns for the PSD-status matrix + scaffolding."""
     cols, names, strings = _grid(viewer, datatype)
-    statuses_db = viewer.status_db.statuses
-
     cells = {c: [] for c in ("x", "y", "color", "status", "expr", "reason")}
     for period, run, start_key, _livetime in cols:
         if start_key is None:
             continue
-        statuses = statuses_db.on(start_key, category=datatype)
+        statuses = viewer.statuses(start_key, category=datatype)
         for name in names:
             entry = statuses.get(name)
             psd = entry.get("psd") if entry is not None else None
@@ -454,15 +450,13 @@ def exposure_cells(viewer, datatype="phy"):
     without a runinfo entry (or without livetime, e.g. cal) contribute zero.
     """
     cols, names, _strings = _grid(viewer, datatype)
-    statuses_db = viewer.status_db.statuses
-
     cells = {c: [] for c in ("x", "exposure", "cumulative", "mass", "livetime", "n_on")}
     total = 0.0
     for period, run, start_key, livetime in cols:
         mass_kg = 0.0
         n_on = 0
         if start_key is not None:
-            statuses = statuses_db.on(start_key, category=datatype)
+            statuses = viewer.statuses(start_key, category=datatype)
             chmap = viewer._channelmap(start_key)
             geds = chmap.map("system", unique=False).geds.map("name")
             for name in names:
