@@ -1,0 +1,135 @@
+<!-- Custom basic-auth login page for the LEGEND event display. Based on
+     Panel's default basic_login.html; must keep the form action
+     (".{{ login_endpoint }}"), the username/password fields and the
+     errormessage block for Panel's BasicLoginHandler to work. -->
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta content="width=device-width, initial-scale=1.0" name="viewport" />
+    <title>LEGEND Event Display | Login</title>
+    <link
+      rel="icon"
+      type="image/png"
+      href="https://legend-exp.org/typo3conf/ext/sitepackage/Resources/Public/Favicons/android-chrome-96x96.png"
+    />
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      html {
+        height: 100%;
+      }
+      body {
+        font-family: "Segoe UI", sans-serif;
+        font-size: 1em;
+        height: 100%;
+        line-height: 1.6;
+      }
+      .wrap {
+        align-items: center;
+        background: #f8f8fa;
+        display: flex;
+        height: 100%;
+        justify-content: center;
+        width: 100%;
+      }
+      .login-form {
+        background: #ffffff;
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        box-shadow: 0 2px 12px rgba(26, 42, 91, 0.08);
+        margin: 0 auto;
+        padding: 2.5em 2em;
+        width: 360px;
+      }
+      .form-header {
+        text-align: center;
+      }
+      #logo {
+        max-width: 220px;
+        height: auto;
+        margin-bottom: 1em;
+      }
+      .form-header p {
+        color: #1a2a5b;
+        padding-bottom: 0.5em;
+      }
+      .form-input {
+        background: #fafafa;
+        border: 1px solid #e2e2e6;
+        border-radius: 4px;
+        padding: 12px;
+        width: 100%;
+      }
+      .form-input:focus {
+        outline: none;
+        border-color: #1a2a5b;
+      }
+      .form-group {
+        margin-bottom: 1em;
+      }
+      .form-button {
+        background: #1a2a5b;
+        border: 1px solid #1a2a5b;
+        border-radius: 4px;
+        color: #ffffff;
+        cursor: pointer;
+        padding: 10px;
+        text-transform: uppercase;
+        width: 100%;
+      }
+      .form-button:hover {
+        background: #24356f;
+      }
+      #error-message {
+        text-align: center;
+        margin-bottom: 0;
+      }
+      .errormessage {
+        color: rgb(200, 0, 0);
+        font-weight: bold;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <form class="login-form" action=".{{ login_endpoint }}" method="post">
+        <div class="form-header">
+          <img
+            id="logo"
+            src="https://legend-exp.org/typo3conf/ext/sitepackage/Resources/Public/Images/Logo/logo_legend_tag_next.svg"
+            alt="LEGEND"
+          />
+          <p>Sign in to the event display</p>
+        </div>
+        <div id="error-message" class="form-group">
+          <p class="errormessage">{{ errormessage|escape }}</p>
+        </div>
+        <div class="form-group">
+          <input
+            name="username"
+            type="text"
+            class="form-input"
+            autocapitalize="off"
+            autocorrect="off"
+            placeholder="username"
+          />
+        </div>
+        <div class="form-group">
+          <input
+            name="password"
+            type="password"
+            class="form-input"
+            placeholder="password"
+          />
+        </div>
+        <div class="form-group">
+          <button class="form-button" type="submit">Login</button>
+        </div>
+      </form>
+    </div>
+  </body>
+</html>

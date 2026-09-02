@@ -57,21 +57,33 @@ def _flatten(obj, rows, prefix=""):
             rows.append((name, _to_py(child.view_as("ak")[0].to_list())))
 
 
-def _read_field(ev, table, path):
-    obj = lh5.read(
-        f"{ev.group}/{table}/{path.replace('.', '/')}",
-        str(ev.current_file),
-        start_row=ev.index,
-        n_rows=1,
-    )
+def read_tables(ev):
+    """Read one row of each evt table (one file open per table).
+
+    The result serves both :func:`summary_dataframe` and
+    :func:`table_dataframe`, so the Event-details tab costs four reads per
+    event instead of one per summary field plus one per table.
+    """
+    return {
+        table: lh5.read(
+            f"{ev.group}/{table}", str(ev.current_file), start_row=ev.index, n_rows=1
+        )
+        for table in TABLES
+    }
+
+
+def _field(obj, path):
+    """Extract ``path`` (dotted) from an already-read one-row lgdo table."""
+    for part in path.split("."):
+        obj = obj[part]
     if isinstance(obj, lgdo.Array):
         return _to_py(obj.nda[0])
     return _to_py(obj.view_as("ak")[0].to_list())
 
 
-def summary_dataframe(ev):
-    """One-row-per-quantity summary of the current event."""
-    timestamp = _read_field(ev, "trigger", "timestamp")
+def summary_dataframe(ev, tables):
+    """One-row-per-quantity summary of the current event from ``read_tables``."""
+    timestamp = _field(tables["trigger"], "timestamp")
     rows = [
         ("period", ev.period),
         ("run", ev.run),
@@ -81,19 +93,16 @@ def summary_dataframe(ev):
         ),
         ("timestamp (original)", timestamp),
     ]
-    rows += [(label, _read_field(ev, table, path)) for label, table, path in SUMMARY]
+    rows += [(label, _field(tables[table], path)) for label, table, path in SUMMARY]
     return pd.DataFrame(
         [(field, str(value)) for field, value in rows], columns=["field", "value"]
     )
 
 
-def table_dataframe(ev, table):
-    """``field | value`` DataFrame for one evt table at the current event."""
-    obj = lh5.read(
-        f"{ev.group}/{table}", str(ev.current_file), start_row=ev.index, n_rows=1
-    )
+def table_dataframe(tables, table):
+    """``field | value`` DataFrame for one evt table from ``read_tables``."""
     rows: list = []
-    _flatten(obj, rows)
+    _flatten(tables[table], rows)
     excluded = EXCLUDE.get(table, set())
     return pd.DataFrame(
         [

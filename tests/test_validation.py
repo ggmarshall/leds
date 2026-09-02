@@ -1,0 +1,380 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import awkward as ak
+import numpy as np
+import pytest
+
+from leds import validation_view
+from leds.validation import (
+    BIN_WIDTHS,
+    K_LINES,
+    ValidationData,
+    cal_curve,
+    cal_residuals,
+    survival_fraction,
+)
+
+DAY = 86400
+T0 = 200 * DAY  # an arbitrary absolute day boundary
+
+
+class FakeViewer:
+    group = "evt"
+
+    def __init__(self, runs=None, paths=None, runinfo=None):
+        self._runs = runs or {}
+        self.paths = paths or {}
+        self.status_db = SimpleNamespace(runinfo=runinfo or {})
+        # distinct per instance, so two fakes never share a shared-cache entry
+        self.cycle_key = f"fake-viewer-{id(self)}"
+
+    def available_runs(self):
+        return self._runs
+
+    def _run_files(self, _period, _run):
+        return []
+
+    def _run_tstamps(self, period, run):
+        return list(self._runs.get(period, {}).get(run, []))
+
+
+def columns(t, **overrides):
+    """Synthetic evt columns: all-physics events unless overridden."""
+    n = len(t)
+    cols = {
+        "timestamp": np.asarray(t, dtype=float),
+        "forced": np.zeros(n, dtype=bool),
+        "puls": np.zeros(n, dtype=bool),
+        "muon": np.zeros(n, dtype=bool),
+        "muon_offline": np.zeros(n, dtype=bool),
+        "spms": np.zeros(n, dtype=bool),
+        "mult": np.ones(n, dtype=np.uint16),
+        "qc": np.ones(n, dtype=bool),
+        "energy": ak.Array([[] for _ in range(n)]),
+        "psd_bb": ak.Array([[] for _ in range(n)]),
+    }
+    cols.update(overrides)
+    return cols
+
+
+def make_data(columns_by_run, runs=None):
+    """A ValidationData whose _columns serves the given synthetic columns."""
+    runs = runs or {"p01": {run: ["ts"] for run in sorted(columns_by_run)}}
+    data = ValidationData(FakeViewer(runs=runs))
+    data._columns = lambda _period, run: columns_by_run[run]  # type: ignore[method-assign]
+    # unit mass so rate expectations stay in plain Hz / counts-per-hour
+    data._mass_kg = lambda _period, _run, _string=None: 1.0  # type: ignore[method-assign]
+    return data
+
+
+def counts_of(data, period, run, key):
+    return data._summary(period, run)["series"][key].view().sum()
+
+
+# ---------------------------------------------------------------- binning
+
+
+@pytest.mark.parametrize("label", list(BIN_WIDTHS))
+def test_constant_rate_flat_at_every_width(label):
+    # one event every 10 s for 6 h -> 0.1 Hz at any bin width, incl. edge bins
+    t = np.arange(T0 + 7200, T0 + 7200 + 6 * 3600, 10.0)
+    data = make_data({"r001": columns(t)})
+    times, rates = data.period_series("p01", BIN_WIDTHS[label])
+
+    assert times.size > 0
+    rate = rates[("trigger", "all triggers")]
+    np.testing.assert_allclose(rate, 0.1, rtol=0.02)
+    # total counts are preserved by the exposure-weighted rebinning
+    summary = data._summary("p01", "r001")
+    assert counts_of(data, "p01", "r001", ("trigger", "all triggers")) == t.size
+    # base axis is day-aligned so every configured width divides it exactly
+    edges = summary["exposure"].axes[0].edges
+    assert edges[0] % DAY == 0
+    assert edges[-1] % DAY == 0
+    assert (edges[-1] - edges[0]) % BIN_WIDTHS[label] == 0
+
+
+def test_rebin_needs_no_reread():
+    t = np.arange(T0, T0 + 3600, 5.0)
+    data = make_data({"r001": columns(t)})
+    data.period_series("p01", 900)
+    data._columns = None  # any further read attempt would raise
+    _times, rates = data.period_series("p01", 3600)  # served from the cache
+    assert np.isfinite(rates[("trigger", "all triggers")]).any()
+
+
+# ---------------------------------------------------------------- baselines
+
+
+def test_forced_and_pulser_excluded_from_physics_series():
+    n = 100
+    t = T0 + np.arange(n, dtype=float)
+    forced = np.zeros(n, dtype=bool)
+    puls = np.zeros(n, dtype=bool)
+    forced[:20] = True
+    puls[20:30] = True
+    data = make_data({"r001": columns(t, forced=forced, puls=puls)})
+
+    assert counts_of(data, "p01", "r001", ("trigger", "all triggers")) == 100
+    assert counts_of(data, "p01", "r001", ("trigger", "forced")) == 20
+    assert counts_of(data, "p01", "r001", ("trigger", "pulser")) == 10
+    # multiplicity and qc series count only the 70 physics events
+    assert counts_of(data, "p01", "r001", ("multiplicity", "m = 1")) == 70
+    assert counts_of(data, "p01", "r001", ("qc", "pass")) == 70
+    assert counts_of(data, "p01", "r001", ("qc", "fail")) == 0
+
+
+def test_kline_cut_configs():
+    k40 = K_LINES["K40"]
+    k42 = K_LINES["K42"]
+    t = T0 + np.arange(5, dtype=float)
+    cols = columns(
+        t,
+        energy=ak.Array([[k40], [k42], [k40], [800.0], [k40, 700.0]]),
+        psd_bb=ak.Array([[True], [False], [True], [True], [False, True]]),
+        qc=np.array([True, False, True, True, True]),
+        mult=np.array([1, 2, 1, 1, 2], dtype=np.uint16),
+        spms=np.array([False, True, False, False, False]),
+        forced=np.array([False, False, True, False, False]),
+    )
+    data = make_data({"r001": cols})
+
+    def k(line, config):
+        return counts_of(data, "p01", "r001", (line, config))
+
+    # event 2 is forced -> excluded everywhere; event 4's only K40 hit fails psd
+    assert k("K40", "before cuts") == 2
+    assert k("K40", "after QC") == 2
+    assert k("K40", "after mult = 1") == 1
+    assert k("K40", "after LAr") == 2
+    assert k("K40", "after PSD") == 1
+    # event 1 fails qc, mult and LAr, and its hit fails psd
+    assert k("K42", "before cuts") == 1
+    assert k("K42", "after QC") == 0
+    assert k("K42", "after mult = 1") == 0
+    assert k("K42", "after LAr") == 0
+    assert k("K42", "after PSD") == 0
+
+
+def test_missing_fields_disable_series_only():
+    t = T0 + np.arange(10, dtype=float)
+    cols = columns(t, mult=None, muon_offline=None, energy=None, psd_bb=None)
+    data = make_data({"r001": cols})
+    times, rates = data.period_series("p01", 3600)
+
+    assert times.size > 0
+    assert rates[("trigger", "muon offline")] is None
+    assert all(rates[("multiplicity", m)] is None for m in ("m = 0", "m = 1"))
+    assert rates[("K40", "before cuts")] is None
+    assert np.isfinite(rates[("trigger", "all triggers")]).any()
+    assert np.isfinite(rates[("qc", "pass")]).any()
+
+
+def test_string_scoping_and_mass_normalisation():
+    k40 = K_LINES["K40"]
+    t = T0 + np.array([0.0, 600.0, 1200.0, 1800.0])
+    cols = columns(
+        t,
+        rawid=ak.Array([[101], [201], [101, 201], []]),
+        energy=ak.Array([[k40], [k40], [800.0, k40], []]),
+        psd_bb=ak.Array([[True], [True], [True, True], []]),
+        mult=np.array([1, 1, 2, 0], dtype=np.uint16),
+    )
+    data = ValidationData(FakeViewer(runs={"p01": {"r001": ["ts"]}}))
+    data._columns = lambda _period, _run: cols  # type: ignore[method-assign]
+    data._string_map = lambda _period, _run: (  # type: ignore[method-assign]
+        {1: frozenset({101}), 2: frozenset({201})},
+        {1: 2.0, 2: 4.0},
+    )
+
+    def n(string, key):
+        return data._summary("p01", "r001", string)["series"][key].view().sum()
+
+    # events count toward a string only when they have a hit in it
+    assert n(1, ("trigger", "all triggers")) == 2  # e0, e2
+    assert n(2, ("trigger", "all triggers")) == 2  # e1, e2
+    assert n(1, ("multiplicity", "m = 1")) == 1
+    assert n(1, ("multiplicity", "m = 2")) == 1
+    assert n(1, ("multiplicity", "m = 0")) == 0  # m=0 events have no hits
+    # the in-window hit must be in the string: e2's K40 hit is in string 2
+    assert n(1, ("K40", "before cuts")) == 1
+    assert n(2, ("K40", "before cuts")) == 2
+
+    assert data._mass_kg("p01", "r001", 1) == 2.0
+    assert data._mass_kg("p01", "r001") == 6.0
+    assert data._mass_kg("p01", "r001", 9) == 0.0
+    assert data.available_strings("p01") == [1, 2]
+
+    # rates are divided by the scope's mass: (2 evts / 2 kg) / (4 evts / 6 kg)
+    _, r1 = data.period_series("p01", 3600, string=1)
+    _, rall = data.period_series("p01", 3600)
+    ratio = r1[("trigger", "all triggers")] / rall[("trigger", "all triggers")]
+    np.testing.assert_allclose(ratio[~np.isnan(ratio)], 1.5)
+
+
+def test_period_series_rejects_bad_bin_seconds():
+    data = make_data({"r001": columns(T0 + np.arange(0.0, 60.0, 10.0))})
+    for bad in (0, 450, 900 + 1, -3600):
+        with pytest.raises(ValueError, match="multiple"):
+            data.period_series("p01", bad)
+
+
+def test_survival_fraction():
+    p = np.array([9.0, 0.0, 0.0, np.nan])
+    f = np.array([1.0, 2.0, 0.0, np.nan])
+    out = survival_fraction(p, f)
+    np.testing.assert_allclose(out[:2], [0.9, 0.0])
+    assert np.isnan(out[2])  # empty bin
+    assert np.isnan(out[3])  # run-gap separator
+    assert survival_fraction(None, f) is None
+    assert survival_fraction(p, None) is None
+
+
+# ---------------------------------------------------------------- period assembly
+
+
+def test_period_concatenation_with_gap():
+    t1 = T0 + np.arange(0, 3600, 10.0)
+    t2 = T0 + 3 * DAY + np.arange(0, 3600, 10.0)
+    data = make_data({"r001": columns(t1), "r002": columns(t2)})
+    times, rates = data.period_series("p01", 3600)
+
+    assert np.all(np.diff(times) > 0)
+    rate = rates[("trigger", "all triggers")]
+    assert rate.size == times.size
+    assert np.isnan(rate).sum() == 1  # exactly the one separator row
+    np.testing.assert_allclose(rate[~np.isnan(rate)], 0.1, rtol=0.02)
+
+
+def test_empty_period():
+    data = make_data({}, runs={"p01": {}})
+    times, rates = data.period_series("p01", 3600)
+    assert times.size == 0
+    assert all(v is None for v in rates.values())
+
+
+# ---------------------------------------------------------------- calibration
+
+
+def synthetic_pars(b=0.5):
+    pk = {
+        2614.511: {
+            "validity": True,
+            "parameters": {"mu": 2614.511 / b},
+            "uncertainties": {"mu": 2.0},
+        },
+        583.191: {
+            "validity": False,  # invalid -> skipped
+            "parameters": {"mu": 583.191 / b},
+            "uncertainties": {"mu": 1.0},
+        },
+        "1000.0": {  # string peak keys must work too
+            "validity": True,
+            "parameters": {"mu": 1000.0 / b},
+            "uncertainties": {"mu": 1.0},
+        },
+    }
+    det = {
+        "pars": {
+            "operations": {
+                "cuspEmax_ctc_cal": {
+                    "expression": "a + b * cuspEmax_ctc",
+                    "parameters": {"a": 0.0, "b": b},
+                }
+            }
+        },
+        "results": {"ecal": {"cuspEmax_ctc_cal": {"pk_fits": pk}}},
+    }
+    return {"V01": det}
+
+
+def test_cal_curve_linear():
+    curve = cal_curve(synthetic_pars(), "V01")
+    np.testing.assert_allclose(curve["peaks"], [1000.0, 2614.511])
+    np.testing.assert_allclose(curve["cal_mu"], curve["peaks"])  # perfect cal
+    np.testing.assert_allclose(curve["residual"], 0.0, atol=1e-9)
+    np.testing.assert_allclose(curve["cal_err"], 0.5 * curve["mu_err"])
+    np.testing.assert_allclose(curve["line_y"], 0.5 * curve["line_x"], atol=1e-9)
+
+
+def test_cal_curve_no_valid_peaks():
+    pars = synthetic_pars()
+    for fit in pars["V01"]["results"]["ecal"]["cuspEmax_ctc_cal"]["pk_fits"].values():
+        fit["validity"] = False
+    with pytest.raises(KeyError):
+        cal_curve(pars, "V01")
+
+
+def test_cal_residuals_order_and_nan():
+    pars = {**synthetic_pars(), "A99": synthetic_pars()["V01"]}
+    names, residuals = cal_residuals(pars, ["V01", "A99", "NOPE"])
+    assert names == ["V01", "A99"]
+    res, _err = residuals[2614.511]
+    np.testing.assert_allclose(res, 0.0, atol=1e-9)
+    res583, _ = residuals[583.191]
+    assert np.isnan(res583).all()  # only invalid fits for that peak
+
+
+def test_load_cal_pars_direct_validity_and_missing(tmp_path):
+    par_root = tmp_path / "par_hit"
+    direct = par_root / "cal" / "p01" / "r001"
+    direct.mkdir(parents=True)
+    (direct / "l200-p01-r001-cal-20250101T000000Z-par_hit.yaml").write_text(
+        "V01:\n  pars: {}\n"
+    )
+    runinfo = {"p02": {"r002": {"phy": {"start_key": "20250601T000000Z"}}}}
+    viewer = FakeViewer(
+        runs={"p01": {"r001": ["x"]}, "p02": {"r002": ["x"]}},
+        paths={"par_hit": str(par_root)},
+        runinfo=runinfo,
+    )
+    data = ValidationData(viewer)
+
+    # 1. the run's own par file wins
+    pars, label = data.load_cal_pars("p01", "r001")
+    assert pars is not None
+    assert "V01" in pars
+    assert label == "cal pars: p01 r001"
+
+    # 2. no direct file -> resolved through validity.yaml at the start key
+    (par_root / "validity.yaml").write_text(
+        "- valid_from: 20250101T000000Z\n"
+        "  apply:\n"
+        "  - cal/p01/r001/l200-p01-r001-cal-20250101T000000Z-par_hit.yaml\n"
+    )
+    pars, label = data.load_cal_pars("p02", "r002")
+    assert pars is not None
+    assert label == "cal pars: p01 r001"
+
+    # 3. nothing resolvable -> (None, reason)
+    viewer2 = FakeViewer(
+        runs={"p03": {"r001": ["x"]}}, paths={"par_hit": str(tmp_path / "nowhere")}
+    )
+    pars, reason = ValidationData(viewer2).load_cal_pars("p03", "r001")
+    assert pars is None
+    assert "no par_hit" in reason
+
+    # 4. cycle without a par_hit path at all
+    pars, reason = ValidationData(FakeViewer()).load_cal_pars("p01", "r001")
+    assert pars is None
+    assert "par_hit" in reason
+
+
+def test_view_builders_smoke():
+    """The figure builders accept real period_series output."""
+    t = T0 + np.arange(0, 7200, 10.0)
+    k40 = K_LINES["K40"]
+    data = make_data(
+        {"r001": columns(t, energy=ak.Array([[k40]] * t.size))},
+    )
+    times, rates = data.period_series("p01", 3600)
+    for name, builder in validation_view.RATE_BUILDERS.items():
+        for log_y in (True, False):
+            assert builder(times, rates, "1 h", log_y=log_y) is not None, name
+
+    names, residuals = cal_residuals(synthetic_pars(), ["V01"])
+    assert validation_view.cal_summary(names, residuals, [1], "cal pars: test")
+    curve = cal_curve(synthetic_pars(), "V01")
+    assert validation_view.cal_detail(curve, "V01", "cal pars: test")

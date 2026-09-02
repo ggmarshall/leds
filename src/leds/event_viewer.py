@@ -4,15 +4,20 @@ import math
 from datetime import UTC, datetime
 from pathlib import Path
 
+import h5py
 import lh5
-import matplotlib as mpl
 import numpy as np
 from legendmeta import LegendMetadata
-from matplotlib.collections import PatchCollection
-from matplotlib.colors import Normalize
-from matplotlib.figure import Figure
-from matplotlib.patches import Polygon
+from packaging.version import Version
 
+from leds._cache import (
+    CHANNELMAPS,
+    METADATA,
+    N_EVENTS,
+    RUN_FILES,
+    RUN_TREES,
+    STATUSES,
+)
 from leds.config import load_paths
 
 
@@ -220,12 +225,46 @@ def get_plot_source(channel_map, strings_dict, dR=160, dH=40):
 # Event data + array view
 # ---------------------------------------------------------------------------
 
+#: Ged seeds derived from a channelmap, kept per viewer. A period can span more
+#: timestamps than this, so eviction must drop the *oldest* entry rather than
+#: the whole cache -- the Dataset tab walks every run of a cycle in order, and
+#: clearing would make it rebuild everything it had just built.
+MAX_CACHED_CHANNELMAPS = 16
+
+#: Static per-channelmap glyph geometry cached on behalf of the view modules.
+MAX_CACHED_VIEWS = 64
+
+#: Raw/evt files held open per session. Small: an event only ever touches its
+#: own run's files, and each handle holds read buffers.
+MAX_OPEN_FILES = 4
+
+#: First metadata tag laying out the analysis map under ``datasets.statuses``;
+#: mirrors the check inside ``LegendMetadata.channelmap``.
+_MIN_STATUSES_TAG = Version("v0.5.9")
+
+
+def _evict(cache, max_items):
+    """Drop the least-recently-inserted entries until ``cache`` fits."""
+    while len(cache) > max_items:
+        cache.pop(next(iter(cache)))
+
+
+def _shared_metadata(path):
+    """One ``LegendMetadata`` per checkout, shared by every session.
+
+    Building one resolves paths and opens a git repo, and its ``TextDB`` file
+    store is what makes runinfo and groupings cheap after the first read --
+    all of it identical for every session pointing at the same checkout.
+    """
+    path = str(path)
+    return METADATA.get((path,), lambda: LegendMetadata(path, lazy=True))
+
 
 class EventViewer:
     """Loads per-detector values for one event and renders the array view.
 
-    Framework-agnostic: it owns a bare matplotlib ``Figure`` (Agg) that a Panel
-    pane (or any host) can display. ``base_path`` selects the production cycle.
+    Framework-agnostic: it only reads and reshapes data, leaving rendering to
+    the view modules. ``base_path`` selects the production cycle.
 
     Events are read from the ``evt`` tier, whose ``evt/geds`` group holds, per
     event, the variable-length list of fired detectors (``detector_name`` /
@@ -260,11 +299,16 @@ class EventViewer:
         self.dsp_group = "dsp" if self.dsp_tier else None
         self.geds_group = f"{self.group}/geds"
 
-        self.meta = LegendMetadata(str(self.paths.metadata), lazy=True)
-        self.status_db = LegendMetadata(str(self.paths.detector_status), lazy=True)
+        self.meta = _shared_metadata(self.paths.metadata)
+        self.status_db = _shared_metadata(self.paths.detector_status)
 
-        self._n_events_cache: dict[str, int] = {}
-        self._status_cache: dict = {}
+        self._geds_seed_cache: dict = {}
+        self._raw_root_cache = None
+        self._open_files: dict = {}  # path -> h5py.File (per-session LRU)
+        self._skip_version_check = None  # resolved once, in _channelmap
+        #: scratch cache for view modules (static per-channelmap glyph data,
+        #: keyed by ("<what>", tstamp, ...)); pruned in get_event()
+        self.view_cache: dict = {}
 
         # populated by get_event()
         self.chmap = None
@@ -300,37 +344,60 @@ class EventViewer:
     def _tier_root(self, tier):
         return Path(self.paths[f"tier_{tier}"]) / self.datatype
 
+    @property
+    def cycle_key(self):
+        """Stable identity of this cycle's event data, for shared cache keys.
+
+        Two viewers with the same key read the same files, so an entry built
+        by one session is valid for another.
+        """
+        return str(self._tier_root(self.tier))
+
     def _run_files(self, period, run):
-        root = self._tier_root(self.tier) / period / run
-        pattern = (
-            f"{self.experiment}-{period}-{run}-{self.datatype}-*-tier_{self.tier}.lh5"
-        )
-        return sorted(root.glob(pattern))
+        # shared and TTL'd: this is called per event (locate/run_length) and
+        # each call otherwise re-globs a possibly slow network filesystem
+        root = self._tier_root(self.tier)
+        key = (str(root), period, run)
+
+        def scan():
+            pattern = (
+                f"{self.experiment}-{period}-{run}-{self.datatype}"
+                f"-*-tier_{self.tier}.lh5"
+            )
+            return sorted((root / period / run).glob(pattern))
+
+        return RUN_FILES.get(key, scan)
 
     def available_runs(self):
-        """Scan the evt tier and return ``{period: {run: [timestamps]}}``."""
-        tree: dict[str, dict[str, list[str]]] = {}
+        """Scan the evt tier and return ``{period: {run: [timestamps]}}``.
+
+        Shared across sessions but short-lived: new runs land while the server
+        is up, and users expect to see them without a restart.
+        """
         root = self._tier_root(self.tier)
-        if not root.is_dir():
+
+        def scan():
+            tree: dict[str, dict[str, list[str]]] = {}
+            if not root.is_dir():
+                return tree
+            for pdir in sorted(p for p in root.glob("p*") if p.is_dir()):
+                for rdir in sorted(r for r in pdir.glob("r*") if r.is_dir()):
+                    tstamps = self._run_tstamps(pdir.name, rdir.name)
+                    if tstamps:
+                        tree.setdefault(pdir.name, {})[rdir.name] = tstamps
             return tree
-        for pdir in sorted(p for p in root.glob("p*") if p.is_dir()):
-            for rdir in sorted(r for r in pdir.glob("r*") if r.is_dir()):
-                tstamps = [
-                    f.name.split("-")[4] for f in self._run_files(pdir.name, rdir.name)
-                ]
-                if tstamps:
-                    tree.setdefault(pdir.name, {})[rdir.name] = tstamps
-        return tree
+
+        return RUN_TREES.get((str(root),), scan)
 
     # -- event location -------------------------------------------------------
 
     def _n_events(self, file):
+        # shared and never expired: a written evt file does not change
         file = str(file)
-        if file not in self._n_events_cache:
-            self._n_events_cache[file] = lh5.read_n_rows(
-                f"{self.geds_group}/multiplicity", file
-            )
-        return self._n_events_cache[file]
+        return N_EVENTS.get(
+            (file, self.geds_group),
+            lambda: lh5.read_n_rows(f"{self.geds_group}/multiplicity", file),
+        )
 
     def run_length(self, period, run):
         """Total number of events across all files of a run."""
@@ -433,22 +500,91 @@ class EventViewer:
 
     # -- event data -----------------------------------------------------------
 
-    def _read_row(self, file, field, local, group=None):
-        """Read one variable-length ``evt`` group row as a Python list."""
-        group = group or self.geds_group
-        vov = lh5.read(f"{group}/{field}", str(file), start_row=local, n_rows=1)
-        return vov.view_as("ak").to_list()[0]
+    def _read_table_row(self, file, group, local, fields):
+        """Read one row of several ``evt`` table fields in a single file open.
+
+        Returns ``{field: python value}`` (variable-length fields as lists).
+        """
+        tbl = lh5.read(
+            group, str(file), start_row=local, n_rows=1, field_mask=list(fields)
+        )
+        return {f: tbl[f].view_as("ak").to_list()[0] for f in fields}
+
+    def statuses(self, start_key, category=None):
+        """Detector statuses at ``start_key``, shared across sessions.
+
+        ``TextDB.on`` re-parses ``validity.yaml`` on *every* call, and the
+        dataset views ask for one status set per run of the cycle -- so this
+        is the accessor those should use rather than reaching into
+        ``status_db.statuses`` themselves.
+        """
+        key = (str(self.paths.detector_status), start_key, category)
+        if category is None:
+            return STATUSES.get(key, lambda: self.status_db.statuses.on(start_key))
+        return STATUSES.get(
+            key, lambda: self.status_db.statuses.on(start_key, category=category)
+        )
 
     def _status_for(self, tstamp):
-        if tstamp not in self._status_cache:
-            self._status_cache[tstamp] = self.status_db.statuses.on(tstamp)
-        return self._status_cache[tstamp]
+        return self.statuses(tstamp)
 
     def usability(self, name):
         """Detector usability ("on"/"ac"/"off") from the status DB for this event."""
         if self._status is not None and name in self._status:
             return str(self._status[name].usability)
         return "off"
+
+    def _skip_git_version_check(self):
+        """Whether ``channelmap()`` may assume the post-v0.5.9 metadata layout.
+
+        Left to itself, ``channelmap()`` decides this by shelling out to
+        ``git describe`` on *every* call -- the bulk of a warm channelmap
+        build, and worse still on a network-mounted ``.git``. The answer only
+        changes when the checkout does, so resolve it once per viewer.
+        """
+        if self._skip_version_check is None:
+            try:
+                self._skip_version_check = bool(
+                    self.meta.__closest_tag__ >= _MIN_STATUSES_TAG
+                    and self.meta.__version__ != str(_MIN_STATUSES_TAG)
+                )
+            except Exception:
+                # not a git checkout (or no tags): channelmap() documents
+                # skip_version_check for exactly this case
+                self._skip_version_check = True
+        return self._skip_version_check
+
+    def _channelmap(self, tstamp):
+        """Channelmap for ``tstamp``, shared across sessions.
+
+        The single most expensive thing a session does: building one parses
+        every detector YAML in the checkout. The result is a deep copy marked
+        read-only all the way down, so sharing it cannot let one session
+        corrupt another's view.
+        """
+        return CHANNELMAPS.get(
+            (str(self.paths.metadata), tstamp),
+            lambda: self.meta.channelmap(
+                tstamp, skip_version_check=self._skip_git_version_check()
+            ),
+        )
+
+    def _geds_seed(self, tstamp):
+        """Baseline ``{detector: 0 | None}`` energies for every ged (cached).
+
+        Seeds every ged so the array view distinguishes "working but no hit"
+        (0 -> grey, under threshold) from "not processable" (None -> white).
+        """
+        seed = self._geds_seed_cache.pop(tstamp, None)  # re-inserted below
+        if seed is None:
+            geds = self.chmap.map("system", unique=False).geds
+            seed = {
+                det: (0 if self.chmap[det].analysis.processable else None)
+                for det in geds.map("name")
+            }
+        self._geds_seed_cache[tstamp] = seed
+        _evict(self._geds_seed_cache, MAX_CACHED_CHANNELMAPS)
+        return dict(seed)
 
     def get_event(self, period, run, idx):
         file, local = self.locate(period, run, idx)
@@ -462,25 +598,26 @@ class EventViewer:
                 f"{self.group}/trigger/timestamp", str(file), start_row=local, n_rows=1
             ).nda[0]
         )
-        self.chmap = self.meta.channelmap(self.tstamp)
+        self.chmap = self._channelmap(self.tstamp)
+        _evict(self.view_cache, MAX_CACHED_VIEWS)
 
-        # Seed every ged so the array view distinguishes "working but no hit"
-        # (0 -> grey, under threshold) from "not processable" (None -> white).
-        geds = self.chmap.map("system", unique=False).geds
-        energies: dict = {
-            det: (0 if self.chmap[det].analysis.processable else None)
-            for det in geds.map("name")
-        }
+        energies = self._geds_seed(self.tstamp)
 
         # Single evt/geds row read gives the fired detectors, their energies and
         # the index back into each channel's raw/hit table (for waveforms).
+        geds_row = self._read_table_row(
+            file,
+            self.geds_group,
+            local,
+            ("detector_name", self.energy_field, "rawid", "hit_idx"),
+        )
         names = [
             n.decode() if isinstance(n, bytes | bytearray) else n
-            for n in self._read_row(file, "detector_name", local)
+            for n in geds_row["detector_name"]
         ]
-        values = self._read_row(file, self.energy_field, local)
-        rawids = self._read_row(file, "rawid", local)
-        hit_idxs = self._read_row(file, "hit_idx", local)
+        values = geds_row[self.energy_field]
+        rawids = geds_row["rawid"]
+        hit_idxs = geds_row["hit_idx"]
 
         self.fired_detectors = []
         for name, val, rawid, hit_idx in zip(
@@ -503,14 +640,18 @@ class EventViewer:
         # SiPMs: per channel, sum the energy of its triggered coincident pulses
         # (evt/spms/energy and is_trig_coin_pulse are nested per pulse).
         self._status = self._status_for(self.tstamp)
-        spm_rawids = self._read_row(file, "rawid", local, group=f"{self.group}/spms")
-        spm_trig = self._read_row(
-            file, "is_trig_coin_pulse", local, group=f"{self.group}/spms"
+        spms_row = self._read_table_row(
+            file,
+            f"{self.group}/spms",
+            local,
+            ("rawid", "is_trig_coin_pulse", "energy"),
         )
-        spm_energy = self._read_row(file, "energy", local, group=f"{self.group}/spms")
         self.spms_energy = {}
         for rawid, pulses, pulse_energy in zip(
-            spm_rawids, spm_trig, spm_energy, strict=True
+            spms_row["rawid"],
+            spms_row["is_trig_coin_pulse"],
+            spms_row["energy"],
+            strict=True,
         ):
             # sum of spms.energy over the channel's triggered coincident pulses
             self.spms_energy[int(rawid)] = sum(
@@ -522,22 +663,50 @@ class EventViewer:
 
     def _raw_root(self):
         """Raw tier root, falling back to ``<tier>/raw`` when the configured
-        ``tier_raw`` path is absent (e.g. blinded/relocated raw)."""
-        configured = Path(self.paths["tier_raw"])
-        if configured.is_dir():
-            return configured
-        return Path(self.paths["tier"]) / "raw"
+        ``tier_raw`` path is absent (e.g. blinded/relocated raw).
+
+        Memoised: this is hit once per waveform trace, and the all-waveforms
+        view draws ~100 of them per render -- that many ``is_dir`` stats is a
+        real cost on a network filesystem.
+        """
+        if self._raw_root_cache is None:
+            configured = Path(self.paths["tier_raw"])
+            self._raw_root_cache = (
+                configured if configured.is_dir() else Path(self.paths["tier"]) / "raw"
+            )
+        return self._raw_root_cache
 
     def raw_file(self):
         """Path to the raw-tier file matching the current event's evt file."""
         name = self.current_file.name.replace(f"tier_{self.tier}", "tier_raw")
         return self._raw_root() / self.datatype / self.period / self.run / name
 
+    def _open(self, path):
+        """A kept-open, read-only handle for ``path``.
+
+        ``lh5.read`` opens and closes the file on every call, and the
+        all-waveforms view makes one call per channel -- ~100 opens per
+        render, each a metadata round-trip on a network filesystem.
+
+        Per session and never shared: HDF5 handles are not fork-safe, and a
+        handle is only ever used from its own session's callbacks, which
+        :class:`leds.app.EventDisplay` serialises under one lock even when
+        Panel runs them on a thread pool (see "Threads" in the README).
+        """
+        path = str(path)
+        handle = self._open_files.pop(path, None)  # re-inserted below (LRU order)
+        if handle is None:
+            handle = h5py.File(path, "r", locking=False)
+        self._open_files[path] = handle
+        while len(self._open_files) > MAX_OPEN_FILES:
+            self._open_files.pop(next(iter(self._open_files))).close()
+        return handle
+
     def read_waveform(self, rawid, hit_idx, kind="waveform_windowed"):
         """Return ``(times_ns, values)`` for one detector's raw waveform."""
         wf = lh5.read(
             f"ch{rawid:07d}/raw/{kind}",
-            str(self.raw_file()),
+            self._open(self.raw_file()),
             start_row=hit_idx,
             n_rows=1,
         )
@@ -546,52 +715,3 @@ class EventViewer:
         dt = float(wf.dt.nda[0])
         times = t0 + dt * np.arange(len(values))
         return times, values
-
-    # -- rendering ------------------------------------------------------------
-
-    def plot(self, fig=None, *, vmin=25, vmax=6000, figsize=(7, 10)):
-        if self.chmap is None:
-            msg = "call get_event() before plot()"
-            raise RuntimeError(msg)
-
-        fig = fig if fig is not None else Figure(figsize=figsize)
-        fig.clf()
-        ax = fig.add_subplot(111)
-
-        channel_map = self.chmap.map("daq.rawid")
-        strings_dict = build_strings_dict(self.chmap)
-        xs, ys, rawids = get_plot_source(channel_map, strings_dict)
-
-        patches = [
-            Polygon(np.column_stack([x, y]), closed=True)
-            for x, y in zip(xs, ys, strict=True)
-        ]
-        values = np.array(
-            [
-                (
-                    v
-                    if (v := self.energy_dict.get(channel_map[r]["name"])) is not None
-                    else np.nan
-                )
-                for r in rawids
-            ],
-            dtype=float,
-        )
-
-        cmap = mpl.colormaps["viridis"].with_extremes(under="grey", bad="white")
-        coll = PatchCollection(
-            patches, cmap=cmap, norm=Normalize(vmin=vmin, vmax=vmax), edgecolor="black"
-        )
-        coll.set_array(values)
-        ax.add_collection(coll, autolim=True)
-        ax.autoscale_view()
-        ax.margins(0.05)
-
-        fig.colorbar(coll, ax=ax, label=f"{self.energy_field} (keV)")
-        mult = "" if self.multiplicity is None else f" M={self.multiplicity}"
-        ax.set_title(f"{self.experiment}-{self.tstamp} idx:{self.index}{mult}")
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-        return fig

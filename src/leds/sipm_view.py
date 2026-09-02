@@ -77,31 +77,45 @@ def _groups(chmap):
     return groups
 
 
+def _static_data(ev, geds_data):
+    """The channelmap-derived glyph columns (everything but ``energy``).
+
+    Positions/labels only change with the channelmap, so they are cached per
+    file timestamp rather than recomputed on every event.
+    """
+    key = ("sipm_static", ev.tstamp)
+    cols = ev.view_cache.get(key)
+    if cols is None:
+        cx, pitch, rect_w, rect_h, row_y = _geom(geds_data)
+        groups = _groups(ev.chmap)
+
+        cols = {c: [] for c in COLUMNS if c != "energy"}
+        for (barrel, position), y in row_y.items():
+            items = groups.get((barrel, position), [])
+            x0 = cx - (len(items) - 1) / 2 * pitch
+            for i, (fiber, name, rawid) in enumerate(items):
+                cols["x"].append(x0 + i * pitch)
+                cols["y"].append(y)
+                cols["w"].append(rect_w)
+                cols["h"].append(rect_h)
+                cols["name"].append(name)
+                cols["rawid"].append(rawid)
+                cols["barrel"].append(barrel)
+                cols["position"].append(position)
+                cols["fiber"].append(fiber)
+        ev.view_cache[key] = cols
+    return cols
+
+
 def build_source_data(ev, geds_data):
     """Per-SiPM glyph columns, positioned around the geds array."""
-    cx, pitch, rect_w, rect_h, row_y = _geom(geds_data)
-    groups = _groups(ev.chmap)
-
-    cols: dict = {c: [] for c in COLUMNS}
-    for (barrel, position), y in row_y.items():
-        items = groups.get((barrel, position), [])
-        x0 = cx - (len(items) - 1) / 2 * pitch
-        for i, (fiber, name, rawid) in enumerate(items):
-            if ev.usability(name) != "on":
-                energy = np.nan  # white
-            else:
-                energy = ev.spms_energy.get(rawid, 0.0)  # 0 -> grey
-            cols["x"].append(x0 + i * pitch)
-            cols["y"].append(y)
-            cols["w"].append(rect_w)
-            cols["h"].append(rect_h)
-            cols["name"].append(name)
-            cols["rawid"].append(rawid)
-            cols["barrel"].append(barrel)
-            cols["position"].append(position)
-            cols["fiber"].append(fiber)
-            cols["energy"].append(energy)
-    return cols
+    static = _static_data(ev, geds_data)
+    energy = [
+        # not usable -> white; usable but no triggered signal (0) -> grey
+        np.nan if ev.usability(name) != "on" else ev.spms_energy.get(rawid, 0.0)
+        for name, rawid in zip(static["name"], static["rawid"], strict=True)
+    ]
+    return {**static, "energy": energy}
 
 
 def row_label_map(geds_data):

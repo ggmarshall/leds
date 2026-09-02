@@ -33,13 +33,17 @@ dependencies = [
   "bokeh>=3.1.1",
   "matplotlib",
   "numpy",
-  "boost-histogram",
+  "awkward",
+  "pandas",
   "dbetto>=1.2.3",
   "pylegendmeta>=1.2.5",
-  "pygama",
   "dspeed",
   "legend-pydataobj",
   "legend-lh5io",
+  "ldap3>=2.9.1",
+  "certifi",
+  "numexpr",
+  "boost-histogram",
 ]
 
 [project.scripts]
@@ -77,7 +81,7 @@ write_to = "src/leds/_version.py"
 
 
 [tool.setuptools.package-data]
-leds = ["logos/*"]
+leds = ["logos/*", "templates/*"]
 
 
 [tool.pytest.ini_options]
@@ -86,6 +90,12 @@ addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
 xfail_strict = true
 filterwarnings = [
   "error",
+  # ldap3 2.9.1 still touches pyasn1's renamed tagMap/typeMap aliases
+  "ignore:tagMap is deprecated:DeprecationWarning",
+  "ignore:typeMap is deprecated:DeprecationWarning",
+  # the app labels its widgets with Panel's `name=`; `label=` only arrives in
+  # Panel 2.0, so this fires once per widget until we can require that version
+  "ignore:Widget.name is deprecated:PendingDeprecationWarning",
 ]
 log_cli_level = "INFO"
 testpaths = [
@@ -95,7 +105,7 @@ testpaths = [
 
 [tool.coverage]
 run.source = ["leds"]
-port.exclude_lines = [
+report.exclude_lines = [
   'pragma: no cover',
   '\.\.\.',
   'if typing.TYPE_CHECKING:',

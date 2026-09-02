@@ -20,12 +20,58 @@ def _bound_factory(base_path):
     return factory
 
 
+def _prewarm(base_path):
+    """Populate the shared caches before ``pn.serve`` forks its workers.
+
+    Bokeh forks for ``--num-procs`` inside ``pn.serve``, so anything cached
+    here is inherited copy-on-write by every worker and the first session each
+    one serves is already warm. Best-effort: a bad path must still leave a
+    server running that can report the problem in-app.
+
+    Deliberately metadata and directory scans only -- **no HDF5 file is opened
+    here**, because HDF5 is not fork-safe and an inherited handle would
+    corrupt reads in the children.
+    """
+    from leds.config import discover_cycles, resolve_base_paths  # noqa: PLC0415
+    from leds.event_viewer import EventViewer  # noqa: PLC0415
+
+    try:
+        for path in discover_cycles(resolve_base_paths(base_path)).values():
+            viewer = EventViewer(path)
+            runs = viewer.available_runs()
+            # the newest run's channelmap is what a new session renders first
+            for period in sorted(runs)[-1:]:
+                for run in sorted(runs[period])[-1:]:
+                    for tstamp in runs[period][run][:1]:
+                        viewer._channelmap(tstamp)
+                        viewer.statuses(tstamp)
+    except Exception as exc:
+        print(  # noqa: T201 (operator-facing CLI warning)
+            f"leds: pre-warm skipped ({type(exc).__name__}: {exc})", file=sys.stderr
+        )
+
+
 def _free_port():
     sock = socket.socket()
     sock.bind(("", 0))
     port = sock.getsockname()[1]
     sock.close()
     return port
+
+
+def _cookie_secret(args):
+    """The signing secret for auth cookies, warning when it is ephemeral."""
+    import secrets  # noqa: PLC0415 (only needed when auth is enabled)
+
+    if args.cookie_secret:
+        return args.cookie_secret
+    print(  # noqa: T201 (intentional operator-facing CLI warning)
+        "leds: no --cookie-secret/$LEDS_COOKIE_SECRET set; using an "
+        "ephemeral one. Provide a fixed secret so logins survive "
+        "restarts and are shared across replicas.",
+        file=sys.stderr,
+    )
+    return secrets.token_hex(32)
 
 
 def _serve(args):
@@ -40,24 +86,56 @@ def _serve(args):
         "show": False,
     }
 
-    # Optional login page. ``basic_auth`` is either a shared password or a path
-    # to a JSON file of {username: password}; both are typically injected by
-    # NERSC Spin as a secret (env var or mounted file).
-    if args.basic_auth:
-        import secrets  # noqa: PLC0415 (only needed when auth is enabled)
+    # Optional login page, two flavours. LDAP ($LEDS_LDAP_*) takes precedence;
+    # otherwise ``basic_auth`` is either a shared password or a path to a JSON
+    # file of {username: password}. Secrets are typically injected by NERSC
+    # Spin as env vars or mounted files.
+    from leds.ldap_auth import LDAPConfig  # noqa: PLC0415 (lazy import)
 
-        cookie_secret = args.cookie_secret or secrets.token_hex(32)
-        if not args.cookie_secret:
+    ldap_cfg = LDAPConfig.from_env()  # None unless $LEDS_LDAP_SERVER is set
+
+    if ldap_cfg or args.basic_auth:
+        import importlib.resources  # noqa: PLC0415 (only needed when auth is on)
+
+        serve_kwargs["cookie_secret"] = _cookie_secret(args)
+        # LEGEND-branded login/logout pages instead of Panel's defaults.
+        templates = importlib.resources.files("leds") / "templates"
+        login_template = str(templates / "login.html")
+        logout_template = str(templates / "logout.html")
+
+    if ldap_cfg:
+        if args.basic_auth:
             print(  # noqa: T201 (intentional operator-facing CLI warning)
-                "leds: no --cookie-secret/$LEDS_COOKIE_SECRET set; using an "
-                "ephemeral one. Provide a fixed secret so logins survive "
-                "restarts and are shared across replicas.",
+                "leds: LEDS_LDAP_SERVER is set; ignoring "
+                "LEDS_BASIC_AUTH/--basic-auth.",
                 file=sys.stderr,
             )
-        serve_kwargs["basic_auth"] = args.basic_auth
-        serve_kwargs["cookie_secret"] = cookie_secret
+        from leds.ldap_auth import LDAPAuthProvider  # noqa: PLC0415
 
-    pn.serve(_bound_factory(args.base_path), **serve_kwargs)
+        # Note: must NOT also pass basic_auth/login_template to pn.serve, or
+        # Panel would build its own auth provider and clobber this one.
+        serve_kwargs["auth_provider"] = LDAPAuthProvider(
+            ldap_cfg,
+            login_template=login_template,
+            logout_template=logout_template,
+        )
+    elif args.basic_auth:
+        serve_kwargs["basic_auth"] = args.basic_auth
+        serve_kwargs["login_template"] = login_template
+        serve_kwargs["logout_template"] = logout_template
+
+    if args.num_threads:
+        # run callbacks on a thread pool so one session's blocking read does
+        # not stall every other session in the worker; see "Threads" in the
+        # README for what this does and does not buy. Set before pn.serve
+        # forks: the pool spawns its threads lazily, so the children inherit
+        # only the configuration, never a live thread.
+        pn.config.nthreads = args.num_threads
+
+    factory = _bound_factory(args.base_path)  # imports leds.app before forking
+    if args.prewarm:
+        _prewarm(args.base_path)
+    pn.serve(factory, **serve_kwargs)
 
 
 def _app(args):
@@ -102,6 +180,24 @@ def main(argv=None):
     serve.add_argument("--port", type=int, default=5006)
     serve.add_argument("--num-procs", type=int, default=1)
     serve.add_argument(
+        "--num-threads",
+        type=int,
+        default=0,
+        help="size of the thread pool callbacks run on, so one session's slow "
+        "read does not freeze the others in its process; 0 (the default) "
+        "keeps everything on the event loop. The container passes "
+        "$NUM_THREADS here, as it does $NUM_PROCS to --num-procs",
+    )
+    serve.add_argument(
+        "--prewarm",
+        action="store_true",
+        default=os.environ.get("LEDS_PREWARM", "").lower() in ("1", "true", "yes"),
+        help="scan the cycles and build the newest channelmap before serving, "
+        "so the first session of every worker is warm (default $LEDS_PREWARM). "
+        "Delays the listening socket by that much -- check it against any "
+        "readiness probe",
+    )
+    serve.add_argument(
         "--allow-websocket-origin",
         action="append",
         help="host[:port] allowed to connect (repeatable)",
@@ -110,7 +206,8 @@ def main(argv=None):
         "--basic-auth",
         default=os.environ.get("LEDS_BASIC_AUTH"),
         help="enable a login page; a shared password or a path to a JSON file "
-        "of {username: password} (default $LEDS_BASIC_AUTH)",
+        "of {username: password} (default $LEDS_BASIC_AUTH). Ignored when "
+        "LDAP login is configured via $LEDS_LDAP_SERVER",
     )
     serve.add_argument(
         "--cookie-secret",

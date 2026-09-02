@@ -68,7 +68,8 @@ repos:
     rev: "v2.4.2"
     hooks:
       - id: codespell
-        args: ["-L", "puls"] # LEGEND pulser-coincidence field name
+        # puls: LEGEND pulser-coincidence field; livetime: physics term
+        args: ["-L", "puls,livetime"]
 
   - repo: https://github.com/shellcheck-py/shellcheck-py
     rev: "v0.10.0.1"
