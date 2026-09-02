@@ -59,24 +59,40 @@ def _rates_figure(times_ms, rates, group, *, title, height=340, log_y=True):
     )
     fig.yaxis.axis_label = GROUP_UNIT_LABEL[GROUP_UNIT_SECONDS[group]]
     missing = []
+    # one source holding the shared time axis and a column per series, rather
+    # than one source (and one duplicated time array) each; likewise a single
+    # HoverTool, since BokehJS hit-tests every tool on every mouse move
+    columns = {"t": times_ms}
+    points = []
     for i, label in enumerate(RATE_GROUPS[group]):
         series = rates.get((group, label))
         if series is None:
             missing.append(label)
             continue
-        source = ColumnDataSource({"t": times_ms, "rate": series})
-        color = _PALETTE[i % len(_PALETTE)]
-        fig.line("t", "rate", source=source, color=color, legend_label=label)
-        pts = fig.scatter(
-            "t", "rate", source=source, color=color, size=4, legend_label=label
+        columns[label] = series
+        points.append((label, _PALETTE[i % len(_PALETTE)]))
+
+    source = ColumnDataSource(columns)
+    for label, color in points:
+        fig.line("t", label, source=source, color=color, legend_label=label)
+        # the renderer name is what the shared hover reads back as $name
+        fig.scatter(
+            "t",
+            label,
+            source=source,
+            color=color,
+            size=4,
+            legend_label=label,
+            name=label,
         )
+    if points:
         fig.add_tools(
             HoverTool(
-                renderers=[pts],
+                renderers=[r for r in fig.renderers if r.name],
                 tooltips=[
-                    ("series", label),
+                    ("series", "$name"),
                     ("time", "@t{%F %T}"),
-                    ("rate", "@rate{0.000}"),
+                    ("rate", "@$name{0.000}"),
                 ],
                 formatters={"@t": "datetime"},
             )
