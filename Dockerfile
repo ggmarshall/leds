@@ -53,6 +53,9 @@ ENV PATH="/opt/venv/bin:$PATH" \
 #                         whole runs of per-hit energies held per worker (4).
 #                         The dominant memory line -- lower it if the container
 #                         is tight, raise it if users hop between runs.
+#   LEDS_MAX_CACHED_CAL_PARS
+#                         parsed par_hit calibration files held per worker (4);
+#                         MB-scale each.
 #
 # Login (all optional; secrets should come from Spin secrets, not the image):
 #   LEDS_COOKIE_SECRET    signs the auth cookie; set a fixed value so logins

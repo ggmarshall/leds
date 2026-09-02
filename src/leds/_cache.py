@@ -135,26 +135,32 @@ METADATA = SharedLRU(8, ttl=METADATA_TTL, name="metadata")
 #: per run of the cycle.
 STATUSES = SharedLRU(256, ttl=METADATA_TTL, name="statuses")
 
-#: ``(par_path, period, run)`` -> parsed ``par_hit`` dict. MB-scale each, and
-#: ~0.7 s to parse, so a small cache with a big payoff.
-CAL_PARS = SharedLRU(_env_int("LEDS_MAX_CACHED_CAL_PARS", 4), name="cal_pars")
+#: ``(par_file,)`` -> parsed ``par_hit`` dict. MB-scale each, and ~0.7 s to
+#: parse, so a small cache with a big payoff. A reprocessing rewrites these
+#: files in place under the same name, hence the TTL.
+CAL_PARS = SharedLRU(
+    _env_int("LEDS_MAX_CACHED_CAL_PARS", 4), ttl=METADATA_TTL, name="cal_pars"
+)
 
 #: Directory scans: ``(tier_root,)`` -> run tree, ``(tier_root, period, run)``
 #: -> file list. Mutable on disk, hence the short TTL.
 RUN_TREES = SharedLRU(16, ttl=SCAN_TTL, name="run_trees")
 RUN_FILES = SharedLRU(1024, ttl=SCAN_TTL, name="run_files")
 
-#: ``(file,)`` -> event count. Written files are immutable, so no TTL.
+#: ``(file, group)`` -> event count. Written files are immutable, so no TTL.
 N_EVENTS = SharedLRU(4096, name="n_events")
 
-#: ``(tier_root, period, run)`` -> the run's whole per-hit energy and cut
-#: arrays. **The dominant memory line**: hundreds of MB per entry on a real
-#: run, so the bound is small and deliberately tunable per deployment.
+#: ``(tier_root, period, run, files)`` -> the run's whole per-hit energy and
+#: cut arrays. **The dominant memory line**: hundreds of MB per entry on a real
+#: run, so the bound is small and deliberately tunable per deployment. Keyed by
+#: the file list, so a run that gains a file is a new entry, not a stale one.
 RUN_SPECTRA = SharedLRU(_env_int("LEDS_MAX_CACHED_RUN_SPECTRA", 4), name="run_spectra")
 
-#: ``(tier_root, period, run, string)`` -> binned validation summary. Reduced
-#: to ~150 kB per entry, so this can be generous.
-VALIDATION_SUMMARIES = SharedLRU(256, name="validation_summaries")
+#: ``(tier_root, period, run, files, string)`` -> binned validation summary.
+#: Reduced to ~150 kB per entry, so this can be generous. The per-string
+#: entries select hits by a rawid -> string map read from the channelmap, so
+#: they are metadata-derived and expire with it.
+VALIDATION_SUMMARIES = SharedLRU(256, ttl=METADATA_TTL, name="validation_summaries")
 
 #: Every cache above, for the warm-up path and for tests.
 ALL = (
